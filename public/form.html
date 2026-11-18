@@ -40,6 +40,13 @@
   .go { width: 100%; padding: 14px; font-size: 17px; font-weight: 600; border: none; border-radius: 12px;
         background: var(--btn); color: var(--btntext); cursor: pointer; }
   .go:disabled { opacity: 0.6; }
+  .btns { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .go.alt { background: transparent; color: var(--btn); border: 2px solid var(--btn); }
+  .done { position: fixed; inset: 0; background: var(--bg); display: flex; flex-direction: column;
+          align-items: center; justify-content: center; padding: 24px; text-align: center; z-index: 10; }
+  .done h2 { margin: 0 0 8px; font-size: 22px; }
+  .done p { color: var(--hint); margin: 0 0 20px; }
+  .done .go { max-width: 320px; margin-bottom: 10px; }
   .msg { color: var(--err); font-size: 14px; min-height: 18px; margin-bottom: 6px; }
   .hidden { display: none; }
 </style>
@@ -77,7 +84,17 @@
   <div class="bar">
     <div class="msg" id="msg"></div>
     <div class="total"><span>Total</span><span id="total">₦0</span></div>
-    <button class="go" id="go" type="button">Preview</button>
+    <div class="btns">
+      <button class="go alt" id="save" type="button">💾 Save PDF</button>
+      <button class="go" id="go" type="button">Preview</button>
+    </div>
+  </div>
+
+  <div class="done hidden" id="done">
+    <h2 id="doneTitle">✅ Saved</h2>
+    <p id="doneText"></p>
+    <button class="go" id="dl" type="button">⬇️ Download PDF</button>
+    <button class="go alt" id="close" type="button">Done</button>
   </div>
 
 <script>
@@ -165,10 +182,11 @@
 
   function showMsg(t) { $('msg').textContent = t || ''; }
 
-  $('go').addEventListener('click', function () {
+  // Reads and validates the form; returns the payload, or null after showing a message
+  function collect() {
     showMsg('');
     var customer = $('customer').value.trim();
-    if (!customer) { showMsg('Please enter the customer name.'); $('customer').focus(); return; }
+    if (!customer) { showMsg('Please enter the customer name.'); $('customer').focus(); return null; }
     var items = [];
     var bad = false;
     document.querySelectorAll('.item').forEach(function (row) {
@@ -180,27 +198,67 @@
       if (!name || !(q > 0) || !(p > 0)) { bad = true; return; }
       items.push({ name: name, qty: q, price: p });
     });
-    if (bad) { showMsg('Each item needs a name, a quantity and a price.'); return; }
-    if (!items.length) { showMsg('Add at least one item.'); return; }
+    if (bad) { showMsg('Each item needs a name, a quantity and a price.'); return null; }
+    if (!items.length) { showMsg('Add at least one item.'); return null; }
+    return {
+      mode: mode, customer: customer, phone: $('phone').value.trim(),
+      items: items, due: mode === 'invoice' ? dueValue() : '', note: $('note').value.trim()
+    };
+  }
 
-    $('go').disabled = true; $('go').textContent = 'Sending…';
-    fetch('/api/submit', {
+  function post(url, payload) {
+    return fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'X-Init-Data': initData },
-      body: JSON.stringify({
-        mode: mode, customer: customer, phone: $('phone').value.trim(),
-        items: items, due: mode === 'invoice' ? dueValue() : '', note: $('note').value.trim()
-      })
-    }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
-      .then(function (res) {
-        if (!res.ok) throw new Error((res.j && res.j.error) || 'Something went wrong');
-        if (tg) tg.close();
-      })
-      .catch(function (e) {
-        showMsg(e.message);
-        $('go').disabled = false; $('go').textContent = 'Preview';
-      });
+      body: JSON.stringify(payload)
+    }).then(function (r) {
+      return r.json().catch(function () { return {}; }).then(function (j) { return { ok: r.ok, j: j }; });
+    }).then(function (res) {
+      if (!res.ok) throw new Error((res.j && res.j.error) || 'Something went wrong');
+      return res.j;
+    });
+  }
+
+  function busy(on, which) {
+    $('go').disabled = on; $('save').disabled = on;
+    $('go').textContent = (on && which === 'go') ? 'Sending…' : 'Preview';
+    $('save').textContent = (on && which === 'save') ? 'Generating…' : '💾 Save PDF';
+  }
+
+  var pdfUrl = '';
+  function openPdf() {
+    if (!pdfUrl) return;
+    if (tg && tg.openLink) tg.openLink(pdfUrl); else window.open(pdfUrl, '_blank');
+  }
+
+  // Preview: sends the draft to the chat (same as before)
+  $('go').addEventListener('click', function () {
+    var payload = collect(); if (!payload) return;
+    busy(true, 'go');
+    post('/api/submit', payload)
+      .then(function () { if (tg) tg.close(); })
+      .catch(function (e) { showMsg(e.message); busy(false); });
   });
+
+  // Save: generate the PDF now, it arrives in the chat as a file, and can be downloaded here too
+  $('save').addEventListener('click', function () {
+    var payload = collect(); if (!payload) return;
+    busy(true, 'save');
+    post('/api/save', payload)
+      .then(function (j) {
+        pdfUrl = j.url || '';
+        $('doneTitle').textContent = '✅ ' + (j.number || 'Saved');
+        $('doneText').textContent = j.sent
+          ? 'Your PDF has been sent to the bot chat as a file.'
+          : 'Your PDF is ready, but Telegram could not deliver it to the chat. Tap Download PDF below.';
+        $('dl').classList.toggle('hidden', !pdfUrl);
+        $('done').classList.remove('hidden');
+        busy(false);
+      })
+      .catch(function (e) { showMsg(e.message); busy(false); });
+  });
+  $('dl').addEventListener('click', openPdf);
+  $('close').addEventListener('click', function () { if (tg) tg.close(); else location.reload(); });
 
   setMode(mode);
   addRow(null, false);

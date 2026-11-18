@@ -72,9 +72,9 @@ const sendPdf = (ctx, buf, filename, extra = {}) =>
 // Direct download links (work even if the server cannot upload files to Telegram)
 const DL_KEY = crypto.createHash('sha256').update(`dl:${BOT_TOKEN}`).digest();
 const dlSig = (p) => crypto.createHmac('sha256', DL_KEY).update(p).digest('base64url');
-function dlUrl(base, tgId, docId) {
+function dlUrl(base, tgId, docId, file) {
   const p = `${tgId}.${docId}.${Date.now() + 10 * 60 * 1000}`;
-  return `${base}/dl/${Buffer.from(p).toString('base64url')}.${dlSig(p)}`;
+  return `${base}/dl/${Buffer.from(p).toString('base64url')}.${dlSig(p)}${file ? `/${encodeURIComponent(file)}` : ''}`;
 }
 function dlParse(token) {
   const [b, sig] = String(token).split('.');
@@ -86,16 +86,30 @@ function dlParse(token) {
   if (!tgId || !docId || Date.now() > exp) return null;
   return { tgId, docId };
 }
-// Try Telegram upload; if it still fails, give the user a direct download button instead
-async function sendPdfSafe(ctx, buf, filename, extra, docId) {
+// Delivery chain: 1) upload the file, 2) let Telegram fetch it from our public URL, 3) caller shows a download button
+async function deliverPdf(chatId, buf, filename, extra, docId) {
   try {
-    return await sendPdf(ctx, buf, filename, extra);
+    await retry(() => bot.telegram.sendDocument(chatId, { source: buf, filename }, extra || {}));
+    return 'upload';
   } catch (e) {
-    console.error('sendDocument failed:', e && e.message);
-    if (!WEBAPP_URL || !docId) throw e;
-    const kb = Markup.inlineKeyboard([[Markup.button.url('⬇️ Download PDF', dlUrl(WEBAPP_URL, ctx.from.id, docId))]]);
-    await ctx.reply('Telegram could not deliver the file just now. Tap below to download it directly (link valid 10 minutes).', opts(kb));
+    console.error('sendDocument (upload) failed:', e && e.message);
   }
+  if (WEBAPP_URL && docId) {
+    try {
+      await retry(() => bot.telegram.sendDocument(chatId, dlUrl(WEBAPP_URL, chatId, docId, filename), extra || {}));
+      return 'url';
+    } catch (e) {
+      console.error('sendDocument (url) failed:', e && e.message);
+    }
+  }
+  return null;
+}
+async function sendPdfSafe(ctx, buf, filename, extra, docId) {
+  const how = await deliverPdf(ctx.from.id, buf, filename, extra, docId);
+  if (how) return;
+  if (!WEBAPP_URL || !docId) throw new Error('Could not send the PDF to Telegram');
+  const kb = Markup.inlineKeyboard([[Markup.button.url('⬇️ Download PDF', dlUrl(WEBAPP_URL, ctx.from.id, docId, filename))]]);
+  await ctx.reply('Telegram could not deliver the file just now. Tap below to download it directly (link valid 10 minutes).', opts(kb));
 }
 const states = new Map(); // tgId -> { step, mode, draft }
 
@@ -594,22 +608,9 @@ bot.action('doc:back', async (ctx) => {
   await showPreview(ctx, st);
 });
 
-bot.action('doc:gen', async (ctx) => {
-  await ctx.answerCbQuery('Generating…');
-  const id = ctx.from.id;
-  const st = states.get(id);
-  if (!st || !st.draft.items.length || !st.draft.customer) return showMenu(ctx);
-
-  const user = await getUser(id);
-  const pro = isPro(user);
-  if (!pro && (await dayCount(id)) >= FREE_LIMIT) {
-    return showUpgrade(ctx, `You've used all ${FREE_LIMIT} free documents for today. Your limit resets at midnight.`);
-  }
-
-  const d = st.draft;
+// Saves the document row (customer, number, totals) and returns what is needed to build the PDF
+async function createDocument(id, mode, d, pro) {
   const template = pro && TEMPLATES[d.template] ? d.template : 'classic';
-
-  // Pro: remember the customer
   let customerId = null;
   if (pro) {
     const cr = await pool.query(
@@ -621,16 +622,12 @@ bot.action('doc:gen', async (ctx) => {
     );
     customerId = cr.rows[0].id;
   }
-
-  const col = st.mode === 'invoice' ? 'inv_seq' : 'rec_seq';
-  const prefix = st.mode === 'invoice' ? 'INV' : 'REC';
-  const r = await pool.query(
-    `UPDATE users SET ${col} = ${col} + 1 WHERE tg_id = $1 RETURNING ${col} AS n`,
-    [id]
-  );
+  const col = mode === 'invoice' ? 'inv_seq' : 'rec_seq';
+  const prefix = mode === 'invoice' ? 'INV' : 'REC';
+  const r = await pool.query(`UPDATE users SET ${col} = ${col} + 1 WHERE tg_id = $1 RETURNING ${col} AS n`, [id]);
   const number = `${prefix}-${String(r.rows[0].n).padStart(4, '0')}`;
   const docData = {
-    kind: st.mode,
+    kind: mode,
     number,
     date: fmtDate(new Date()),
     customer: d.customer,
@@ -645,9 +642,27 @@ bot.action('doc:gen', async (ctx) => {
   const total = calcTotals(d.items, d.vatRate, d.whtRate).total;
   const ins = await pool.query(
     'INSERT INTO documents (tg_id, kind, number, data, total, customer_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
-    [id, st.mode, number, JSON.stringify(docData), total, customerId]
+    [id, mode, number, JSON.stringify(docData), total, customerId]
   );
+  return { docId: ins.rows[0].id, docData, total, number };
+}
 
+bot.action('doc:gen', async (ctx) => {
+  await ctx.answerCbQuery('Generating…');
+  const id = ctx.from.id;
+  const st = states.get(id);
+  if (!st || !st.draft.items.length || !st.draft.customer) {
+    await ctx.reply('This draft has expired (the bot may have restarted). Please start again.');
+    return showMenu(ctx, true);
+  }
+
+  const user = await getUser(id);
+  const pro = isPro(user);
+  if (!pro && (await dayCount(id)) >= FREE_LIMIT) {
+    return showUpgrade(ctx, `You've used all ${FREE_LIMIT} free documents for today. Your limit resets at midnight.`);
+  }
+
+  const { docId, docData, total, number } = await createDocument(id, st.mode, st.draft, pro);
   const logo = pro && user.has_logo ? await getLogo(id) : null;
   const buf = await buildPdf({ user, logo, pro, doc: docData, botName: BOT_NAME });
   states.delete(id);
@@ -656,7 +671,7 @@ bot.action('doc:gen', async (ctx) => {
   } catch (e) {
     /* ignore */
   }
-  await sendPdfSafe(ctx, buf, `${number}.pdf`, { caption: `${number} · ₦${money(total)}` }, ins.rows[0].id);
+  await sendPdfSafe(ctx, buf, `${number}.pdf`, { caption: `${number} · ₦${money(total)}` }, docId);
   await showMenu(ctx, true);
 });
 
@@ -1288,6 +1303,40 @@ app.get('/api/init', async (req, res) => {
   }
 });
 
+// Validates the form body and builds the draft (shared by Preview and Save)
+function draftFromBody(b, u, pro, prev) {
+  b = b || {};
+  const mode = b.mode === 'receipt' ? 'receipt' : 'invoice';
+  const customer = String(b.customer || '').trim().slice(0, 80);
+  const items = (Array.isArray(b.items) ? b.items : [])
+    .slice(0, 30)
+    .map((i) => ({
+      name: cap(String((i && i.name) || '').trim().slice(0, 80)),
+      qty: Number(i && i.qty),
+      price: Number(i && i.price),
+    }))
+    .filter((i) => i.name && isFinite(i.qty) && i.qty > 0 && isFinite(i.price) && i.price > 0);
+  if (!customer) return { status: 400, error: 'Please enter the customer name.' };
+  if (!items.length) return { status: 400, error: 'Please add at least one item with a price.' };
+  const { due, raw } = formatDue(b.due);
+  return {
+    mode,
+    draft: {
+      customer,
+      phone: String(b.phone || '').trim().slice(0, 30) || null,
+      items,
+      due,
+      dueRaw: raw,
+      vatRate: b.vat !== undefined ? Number(b.vat) || null : (prev && prev.draft && prev.draft.vatRate) || null,
+      whtRate: b.wht !== undefined ? Number(b.wht) || null : (prev && prev.draft && prev.draft.whtRate) || null,
+      note: String(b.note || '').trim().slice(0, 200) || null,
+      template: (prev && prev.draft && prev.draft.template) || (pro ? u.template || 'classic' : 'classic'),
+    },
+  };
+}
+
+const limitError = `You've used all ${FREE_LIMIT} free documents for today. Your limit resets at midnight. Upgrade from the bot menu (⭐ Upgrade).`;
+
 app.post('/api/submit', async (req, res) => {
   try {
     const tg = verifyInitData(req.get('X-Init-Data'));
@@ -1295,45 +1344,11 @@ app.post('/api/submit', async (req, res) => {
     const id = tg.id;
     const u = await getUser(id);
     if (!u) return res.status(404).json({ error: 'Open the bot and send /start first.' });
-
-    const b = req.body || {};
-    const mode = b.mode === 'receipt' ? 'receipt' : 'invoice';
-    const customer = String(b.customer || '').trim().slice(0, 80);
-    const items = (Array.isArray(b.items) ? b.items : [])
-      .slice(0, 30)
-      .map((i) => ({
-        name: cap(String((i && i.name) || '').trim().slice(0, 80)),
-        qty: Number(i && i.qty),
-        price: Number(i && i.price),
-      }))
-      .filter((i) => i.name && isFinite(i.qty) && i.qty > 0 && isFinite(i.price) && i.price > 0);
-    if (!customer) return res.status(400).json({ error: 'Please enter the customer name.' });
-    if (!items.length) return res.status(400).json({ error: 'Please add at least one item with a price.' });
-
     const pro = isPro(u);
-    if (!pro && (await dayCount(id)) >= FREE_LIMIT) {
-      return res.status(403).json({
-        error: `You've used all ${FREE_LIMIT} free documents for today. Your limit resets at midnight. Upgrade from the bot menu (⭐ Upgrade).`,
-      });
-    }
-    const prev = states.get(id);
-    const { due, raw } = formatDue(b.due);
-    const st = {
-      step: 'preview',
-      mode,
-      draft: {
-        customer,
-        phone: String(b.phone || '').trim().slice(0, 30) || null,
-        items,
-        due,
-        dueRaw: raw,
-        vatRate: b.vat !== undefined ? Number(b.vat) || null : (prev && prev.draft && prev.draft.vatRate) || null,
-        whtRate: b.wht !== undefined ? Number(b.wht) || null : (prev && prev.draft && prev.draft.whtRate) || null,
-        note: String(b.note || '').trim().slice(0, 200) || null,
-        template:
-          (prev && prev.draft && prev.draft.template) || (pro ? u.template || 'classic' : 'classic'),
-      },
-    };
+    const r = draftFromBody(req.body, u, pro, states.get(id));
+    if (r.error) return res.status(r.status).json({ error: r.error });
+    if (!pro && (await dayCount(id)) >= FREE_LIMIT) return res.status(403).json({ error: limitError });
+    const st = { step: 'preview', mode: r.mode, draft: r.draft };
     states.set(id, st);
     await bot.telegram.sendMessage(id, previewText(st), opts(previewKeyboard(st)));
     res.json({ ok: true });
@@ -1343,6 +1358,47 @@ app.post('/api/submit', async (req, res) => {
   }
 });
 
+// Save: generate the PDF straight from the form, send it to the bot chat as a file, return a download link
+app.post('/api/save', async (req, res) => {
+  try {
+    const tg = verifyInitData(req.get('X-Init-Data'));
+    if (!tg) return res.status(401).json({ error: 'unauthorized' });
+    const id = tg.id;
+    const u = await getUser(id);
+    if (!u) return res.status(404).json({ error: 'Open the bot and send /start first.' });
+    const pro = isPro(u);
+    const r = draftFromBody(req.body, u, pro, states.get(id));
+    if (r.error) return res.status(r.status).json({ error: r.error });
+    if (!pro && (await dayCount(id)) >= FREE_LIMIT) return res.status(403).json({ error: limitError });
+
+    const { docId, docData, total, number } = await createDocument(id, r.mode, r.draft, pro);
+    states.delete(id);
+    const logo = pro && u.has_logo ? await getLogo(id) : null;
+    const buf = await buildPdf({ user: u, logo, pro, doc: docData, botName: BOT_NAME });
+    const filename = `${number}.pdf`;
+    const how = await deliverPdf(id, buf, filename, { caption: `${number} · ₦${money(total)}` }, docId);
+    // Show the main menu under the PDF, same as after Generate PDF
+    try {
+      const fresh = await getUser(id);
+      await bot.telegram.sendMessage(
+        id,
+        `<b>🧾 Invoice &amp; Receipt Bot</b>\nCreate professional PDF invoices and receipts in seconds.\n\n${await statusLine(fresh)}\n\nWhat would you like to do?`,
+        opts(menuKeyboard(id))
+      );
+    } catch (e) {
+      console.error('menu send failed:', e && e.message);
+    }
+    res.json({
+      ok: true,
+      number,
+      sent: !!how,
+      url: dlUrl(WEBAPP_URL || `https://${req.get('host')}`, id, docId, filename),
+    });
+  } catch (e) {
+    console.error('save error', e);
+    res.status(500).json({ error: 'Could not generate the PDF. Please try again.' });
+  }
+});
 
 // ───────────────────────── Manager Mini App API (profile, customers, downloads) ─────────────────────────
 // Every route checks Telegram's signed initData, so a user can only touch their own data.
@@ -1512,7 +1568,7 @@ app.post('/api/docs/:id/link', wrap(async (req, res, { tg }) => {
 }));
 
 // Direct PDF download via short-lived signed link
-app.get('/dl/:token', async (req, res) => {
+app.get(['/dl/:token', '/dl/:token/:file'], async (req, res) => {
   try {
     const t = dlParse(req.params.token);
     if (!t) return res.status(403).send('This link is invalid or has expired. Open the bot and try again.');
