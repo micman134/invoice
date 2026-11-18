@@ -5,6 +5,7 @@ const { Pool } = require('pg');
 const axios = require('axios');
 const express = require('express');
 const crypto = require('crypto');
+const https = require('https');
 const { buildPdf, TEMPLATES, money, sumItems } = require('./pdf');
 
 // ───────────────────────── Config ─────────────────────────
@@ -45,7 +46,30 @@ const pool = new Pool({
   connectionString: DATABASE_URL,
   ssl: PGSSL === 'true' ? { rejectUnauthorized: false } : undefined,
 });
-const bot = new Telegraf(BOT_TOKEN);
+// FIX for "socket hang up": use a fresh IPv4 connection per request (no stale keep-alive sockets)
+const bot = new Telegraf(BOT_TOKEN, {
+  handlerTimeout: 120000,
+  telegram: { agent: new https.Agent({ keepAlive: false, family: 4 }) },
+});
+
+// ───────────────────────── Network helpers (retry on dropped connections) ─────────────────────────
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const TRANSIENT = /socket hang up|ECONNRESET|ETIMEDOUT|ECONNREFUSED|EAI_AGAIN|ENOTFOUND|EPIPE|network|timeout/i;
+async function retry(fn, tries = 3) {
+  for (let i = 1; ; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      const msg = `${(e && e.message) || ''} ${(e && e.code) || ''}`;
+      if (i >= tries || !TRANSIENT.test(msg)) throw e;
+      await sleep(700 * i);
+    }
+  }
+}
+const sendPdf = (ctx, buf, filename, extra = {}) =>
+  retry(() => ctx.replyWithDocument({ source: buf, filename }, extra));
+const sendPdfTo = (chatId, buf, filename, extra = {}) =>
+  retry(() => bot.telegram.sendDocument(chatId, { source: buf, filename }, extra));
 const states = new Map(); // tgId -> { step, mode, draft }
 
 // ───────────────────────── Database ─────────────────────────
@@ -131,6 +155,7 @@ async function monthCount(id) {
   return r.rows[0].n;
 }
 
+const historyLimit = (pro) => (pro ? 10 : 3);
 const isAdmin = (id) => ADMIN_IDS.includes(Number(id));
 const isPro = (u) =>
   !!u && (isAdmin(u.tg_id) || !!(u.plan_expires && new Date(u.plan_expires) > new Date()));
@@ -261,6 +286,7 @@ const menuKeyboard = (uid) => {
     [btn('👥 Customers', 'custs:0'), btn('📂 My Documents', 'hist')],
     [btn('🏢 Business Profile', 'prof'), btn('🎨 Templates', 'tpls')],
   ];
+  if (WEBAPP_URL) rows.push([Markup.button.webApp('🗂 Open Manager (forms)', `${WEBAPP_URL}/manage`)]);
   rows.push(isAdmin(uid) ? [btn('ℹ️ Help', 'help')] : [btn('⭐ Upgrade', 'up'), btn('ℹ️ Help', 'help')]);
   return Markup.inlineKeyboard(rows);
 };
@@ -520,10 +546,7 @@ bot.action('doc:gen', async (ctx) => {
   } catch (e) {
     /* ignore */
   }
-  await ctx.replyWithDocument(
-    { source: buf, filename: `${number}.pdf` },
-    { caption: `${number} · ₦${money(total)}` }
-  );
+  await sendPdf(ctx, buf, `${number}.pdf`, { caption: `${number} · ₦${money(total)}` });
   await showMenu(ctx, true);
 });
 
@@ -535,7 +558,7 @@ bot.action('hist', async (ctx) => {
   const pro = isPro(u);
   const r = await pool.query(
     'SELECT id, number, total, created_at FROM documents WHERE tg_id = $1 ORDER BY created_at DESC LIMIT $2',
-    [ctx.from.id, pro ? 10 : 3]
+    [ctx.from.id, historyLimit(pro)]
   );
   if (!r.rowCount) {
     return show(ctx, 'No documents yet. Create your first one!', backToMenu());
@@ -543,6 +566,7 @@ bot.action('hist', async (ctx) => {
   const rows = r.rows.map((d) => [
     btn(`${d.number} · ₦${money(d.total)} · ${fmtDate(d.created_at)}`, `doc:view:${d.id}`),
   ]);
+  if (WEBAPP_URL) rows.push([Markup.button.webApp('📥 Open downloads page', `${WEBAPP_URL}/manage?tab=docs`)]);
   rows.push([btn('⬅️ Back', 'menu')]);
   const note = pro
     ? 'Your last 10 documents. Tap one to get the PDF again.'
@@ -560,7 +584,7 @@ bot.action(/^doc:view:(\d+)$/, async (ctx) => {
   const logo = pro && user.has_logo ? await getLogo(id) : null;
   const doc = r.rows[0].data;
   const buf = await buildPdf({ user, logo, pro, doc, botName: BOT_NAME });
-  await ctx.replyWithDocument({ source: buf, filename: `${doc.number}.pdf` });
+  await sendPdf(ctx, buf, `${doc.number}.pdf`);
 });
 
 // ───────────────────────── Customers (Pro) ─────────────────────────
@@ -581,10 +605,11 @@ async function showCustomerList(ctx, page, mode) {
   if (page > 0) nav.push(btn('◀️ Prev', `${prefix}:${page - 1}`));
   if ((page + 1) * PAGE < cnt) nav.push(btn('Next ▶️', `${prefix}:${page + 1}`));
   if (nav.length) rows.push(nav);
+  if (WEBAPP_URL && !mode) rows.push([Markup.button.webApp('➕ Add / edit in form', `${WEBAPP_URL}/manage?tab=customers`)]);
   rows.push([btn('⬅️ Back', mode ? `new:${mode}` : 'menu')]);
   let text;
   if (!cnt) {
-    text = '<b>👥 Customers</b>\nNo customers yet. They are saved automatically each time you create a document.';
+    text = `<b>👥 Customers</b>\nNo customers yet. They are saved automatically each time you create a document${WEBAPP_URL ? ', or add one with the form below' : ''}.`;
   } else if (mode) {
     text = `<b>Choose a customer</b> (${cnt})`;
   } else {
@@ -759,10 +784,10 @@ bot.action(/^tpl:view:(\w+)$/, async (ctx) => {
     [allowed ? btn(`✅ Use ${t.name} as default`, `tpl:set:${key}`) : btn('⭐ Upgrade to unlock', 'up')],
     [btn('⬅️ All templates', 'tpls')],
   ]);
-  await ctx.replyWithDocument(
-    { source: buf, filename: `sample-${key}.pdf` },
-    { caption: `${t.name} template (sample)`, reply_markup: kb.reply_markup }
-  );
+  await sendPdf(ctx, buf, `sample-${key}.pdf`, {
+    caption: `${t.name} template (sample)`,
+    reply_markup: kb.reply_markup,
+  });
 });
 
 bot.action(/^tpl:set:(\w+)$/, async (ctx) => {
@@ -792,13 +817,16 @@ async function showProfile(ctx) {
     `Bank details: ${u.bank ? esc(u.bank) : '<i>not set</i>'}${pro ? '' : ' 🔒'}\n` +
     `Logo: ${u.has_logo ? 'uploaded' : 'none'}${pro ? '' : ' 🔒'}\n` +
     `Brand colour: #${u.accent}${pro ? '' : ' 🔒'}`;
-  const kb = Markup.inlineKeyboard([
+  const rows = [];
+  if (WEBAPP_URL) rows.push([Markup.button.webApp('📝 Edit in form', `${WEBAPP_URL}/manage?tab=profile`)]);
+  rows.push(
     [btn('Name', 'prof:name'), btn('Phone', 'prof:phone'), btn('Address', 'prof:addr')],
     [btn(`${lock}Bank details`, 'prof:bank'), btn(`${lock}Logo`, 'prof:logo')],
     [btn(`${lock}Brand colour`, 'prof:color')],
     [btn('🗑 Delete my data', 'del')],
-    [btn('⬅️ Back', 'menu')],
-  ]);
+    [btn('⬅️ Back', 'menu')]
+  );
+  const kb = Markup.inlineKeyboard(rows);
   await show(ctx, text, kb);
 }
 
@@ -1028,6 +1056,7 @@ bot.on('text', async (ctx) => {
 
     case 'due':
       st.draft.due = text.slice(0, 40);
+      st.draft.dueRaw = st.draft.due;
       st.step = 'preview';
       return ctx.reply(previewText(st), opts(previewKeyboard(st)));
 
@@ -1066,6 +1095,11 @@ app.get('/form', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'form.html'));
 });
 
+app.get('/manage', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.sendFile(path.join(__dirname, 'public', 'manage.html'));
+});
+
 // Validates Telegram Mini App initData and returns the Telegram user (or null)
 function verifyInitData(initData) {
   if (!initData) return null;
@@ -1089,7 +1123,7 @@ function verifyInitData(initData) {
   }
 }
 
-app.use('/api', express.json({ limit: '100kb' }));
+app.use('/api', express.json({ limit: '3mb' }));
 
 app.get('/api/init', async (req, res) => {
   try {
@@ -1177,6 +1211,173 @@ app.post('/api/submit', async (req, res) => {
   }
 });
 
+
+// ───────────────────────── Manager Mini App API (profile, customers, downloads) ─────────────────────────
+// Every route checks Telegram's signed initData, so a user can only touch their own data.
+const wrap = (fn) => async (req, res) => {
+  try {
+    const tg = verifyInitData(req.get('X-Init-Data'));
+    if (!tg) return res.status(401).json({ error: 'unauthorized' });
+    const u = await getUser(tg.id);
+    if (!u) return res.status(404).json({ error: 'Open the bot and send /start first.' });
+    await fn(req, res, { tg, u, pro: isPro(u) });
+  } catch (e) {
+    console.error('api error:', e && e.message);
+    if (!res.headersSent) res.status(500).json({ error: 'Server error' });
+  }
+};
+const needPro = (res, a, what) => {
+  if (a.pro) return false;
+  res.status(403).json({ error: `${what} is a Pro feature.` });
+  return true;
+};
+const clean = (v, n) => String(v == null ? '' : v).trim().slice(0, n) || null;
+
+async function listCustomers(id) {
+  const r = await pool.query(
+    `SELECT c.id, c.name, c.phone,
+            (SELECT count(*)::int FROM documents d WHERE d.tg_id = c.tg_id AND d.customer_id = c.id) AS docs
+     FROM customers c WHERE c.tg_id = $1 ORDER BY c.last_used DESC LIMIT 500`,
+    [id]
+  );
+  return r.rows;
+}
+
+async function listDocs(id, pro) {
+  const r = await pool.query(
+    `SELECT id, kind, number, total, created_at, data->>'customer' AS customer
+     FROM documents WHERE tg_id = $1 ORDER BY created_at DESC LIMIT $2`,
+    [id, historyLimit(pro)]
+  );
+  return r.rows;
+}
+
+app.get('/api/manage/init', wrap(async (req, res, { tg, u, pro }) => {
+  if (pro) await syncCustomers(tg.id);
+  const [customers, docs] = await Promise.all([pro ? listCustomers(tg.id) : [], listDocs(tg.id, pro)]);
+  res.json({
+    pro,
+    status: await statusLine(u),
+    user: {
+      biz_name: u.biz_name || '',
+      phone: u.phone || '',
+      address: u.address || '',
+      bank: u.bank || '',
+      accent: u.accent || '1f3a5f',
+      template: pro ? u.template || 'classic' : 'classic',
+      has_logo: u.has_logo,
+    },
+    colors: COLORS,
+    templates: Object.entries(TEMPLATES).map(([key, t]) => ({ key, name: t.name, free: !!t.free })),
+    customers,
+    docs,
+  });
+}));
+
+// Business profile
+app.post('/api/profile', wrap(async (req, res, { tg, pro }) => {
+  const b = req.body || {};
+  const sets = {
+    biz_name: clean(b.biz_name, 60),
+    phone: clean(b.phone, 30),
+    address: clean(b.address, 120),
+  };
+  if (pro) {
+    sets.bank = clean(b.bank, 200);
+    if (/^[0-9a-f]{6}$/i.test(String(b.accent || ''))) sets.accent = String(b.accent).toLowerCase();
+    if (TEMPLATES[b.template]) sets.template = b.template;
+  }
+  const cols = Object.keys(sets); // fixed, whitelisted column names
+  await pool.query(
+    `UPDATE users SET ${cols.map((c, i) => `${c} = $${i + 2}`).join(', ')} WHERE tg_id = $1`,
+    [tg.id, ...cols.map((c) => sets[c])]
+  );
+  res.json({ ok: true });
+}));
+
+// Logo (PNG or JPEG, sent as a data URL already resized by the page)
+const isPng = (b) => b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4e && b[3] === 0x47;
+const isJpg = (b) => b.length > 4 && b[0] === 0xff && b[1] === 0xd8;
+
+app.get('/api/logo', wrap(async (req, res, { tg, pro }) => {
+  const logo = pro ? await getLogo(tg.id) : null;
+  if (!logo) return res.sendStatus(404);
+  res.set('Cache-Control', 'no-store');
+  res.type(isPng(logo) ? 'image/png' : 'image/jpeg').send(logo);
+}));
+
+app.post('/api/logo', wrap(async (req, res, a) => {
+  if (needPro(res, a, 'Your logo on documents')) return;
+  const s = String((req.body && req.body.image) || '');
+  const i = s.indexOf(',');
+  if (i < 0 || !/^data:image\/(png|jpeg);base64$/.test(s.slice(0, i))) {
+    return res.status(400).json({ error: 'Please choose a PNG or JPG image.' });
+  }
+  const buf = Buffer.from(s.slice(i + 1), 'base64');
+  if (!isPng(buf) && !isJpg(buf)) return res.status(400).json({ error: 'That image could not be read.' });
+  if (buf.length > 1.5 * 1024 * 1024) return res.status(413).json({ error: 'Image is too large.' });
+  await pool.query('UPDATE users SET logo = $2 WHERE tg_id = $1', [a.tg.id, buf]);
+  res.json({ ok: true });
+}));
+
+app.delete('/api/logo', wrap(async (req, res, { tg }) => {
+  await pool.query('UPDATE users SET logo = NULL WHERE tg_id = $1', [tg.id]);
+  res.json({ ok: true });
+}));
+
+// Customers
+app.post('/api/customers', wrap(async (req, res, a) => {
+  if (needPro(res, a, 'Saved customers')) return;
+  const b = req.body || {};
+  const name = clean(b.name, 80);
+  if (!name) return res.status(400).json({ error: 'Please enter the customer name.' });
+  const phone = clean(b.phone, 30);
+  const id = a.tg.id;
+  if (b.id) {
+    const c = await getCustomer(id, Number(b.id));
+    if (!c) return res.status(404).json({ error: 'Customer not found.' });
+    try {
+      await pool.query(
+        'UPDATE customers SET name = $3, name_key = $4, phone = $5 WHERE tg_id = $1 AND id = $2',
+        [id, c.id, name, name.toLowerCase(), phone]
+      );
+    } catch (e) {
+      if (e.code === '23505') return res.status(409).json({ error: 'A customer with that name already exists.' });
+      throw e;
+    }
+  } else {
+    await pool.query(
+      `INSERT INTO customers (tg_id, name, name_key, phone) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (tg_id, name_key)
+       DO UPDATE SET last_used = now(), phone = COALESCE(EXCLUDED.phone, customers.phone)`,
+      [id, name, name.toLowerCase(), phone]
+    );
+  }
+  res.json({ ok: true, customers: await listCustomers(id) });
+}));
+
+app.delete('/api/customers/:id', wrap(async (req, res, a) => {
+  if (needPro(res, a, 'Saved customers')) return;
+  const cid = Number(req.params.id);
+  if (!Number.isInteger(cid)) return res.status(400).json({ error: 'Bad request' });
+  await pool.query('UPDATE documents SET customer_id = NULL WHERE tg_id = $1 AND customer_id = $2', [a.tg.id, cid]);
+  await pool.query('DELETE FROM customers WHERE tg_id = $1 AND id = $2', [a.tg.id, cid]);
+  res.json({ ok: true, customers: await listCustomers(a.tg.id) });
+}));
+
+// Downloads: the PDF is sent to the user's Telegram chat (reliable inside the Mini App)
+app.post('/api/docs/:id/send', wrap(async (req, res, { tg, u, pro }) => {
+  const did = Number(req.params.id);
+  if (!Number.isInteger(did)) return res.status(400).json({ error: 'Bad request' });
+  const r = await pool.query('SELECT data, total FROM documents WHERE id = $1 AND tg_id = $2', [did, tg.id]);
+  if (!r.rowCount) return res.status(404).json({ error: 'Document not found.' });
+  const doc = r.rows[0].data;
+  const logo = pro && u.has_logo ? await getLogo(tg.id) : null;
+  const buf = await buildPdf({ user: u, logo, pro, doc, botName: BOT_NAME });
+  await sendPdfTo(tg.id, buf, `${doc.number}.pdf`, { caption: `${doc.number} · ₦${money(r.rows[0].total)}` });
+  res.json({ ok: true });
+}));
+
 app.post('/paystack/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   const sig = req.headers['x-paystack-signature'];
   const hash = crypto.createHmac('sha512', PAYSTACK_SECRET || '').update(req.body).digest('hex');
@@ -1207,7 +1408,7 @@ app.post('/paystack/webhook', express.raw({ type: '*/*' }), async (req, res) => 
 // ───────────────────────── Start ─────────────────────────
 (async () => {
   await initDb();
-  const me = await bot.telegram.getMe();
+  const me = await retry(() => bot.telegram.getMe());
   BOT_NAME = me.username;
   app.listen(PORT, () => console.log(`Web server on :${PORT}`));
   bot.launch().catch((e) => {
