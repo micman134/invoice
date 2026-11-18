@@ -1045,9 +1045,13 @@ bot.on('text', async (ctx) => {
 });
 
 bot.catch(async (err, ctx) => {
-  console.error('Bot error', err);
+  console.error('Bot error:', err && err.stack ? err.stack : err);
   try {
-    await ctx.reply('Something went wrong. Please try again.', opts(menuKeyboard(ctx.from && ctx.from.id)));
+    const detail =
+      ctx.from && isAdmin(ctx.from.id)
+        ? `\n\n<code>${esc(String((err && err.message) || err).slice(0, 300))}</code>`
+        : '';
+    await ctx.reply('Something went wrong. Please try again.' + detail, opts(menuKeyboard(ctx.from && ctx.from.id)));
   } catch (e) {
     /* ignore */
   }
