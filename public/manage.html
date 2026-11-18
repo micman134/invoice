@@ -85,6 +85,8 @@ const fdate = (d) => new Date(d).toLocaleDateString('en-GB', { day: '2-digit', m
 let S = null;
 let tab = new URLSearchParams(location.search).get('tab');
 if (!['profile', 'customers', 'docs'].includes(tab)) tab = 'profile';
+const SOLO = new URLSearchParams(location.search).get('solo') === '1';
+if (SOLO) $('#tabs').style.display = 'none';
 let editing = null; // customer being added/edited
 let cq = '', dq = '';
 
@@ -206,8 +208,9 @@ async function saveProfile(btn) {
   readProfileInputs();
   btn.disabled = true;
   try {
-    await api('/profile', 'POST', S.user);
+    await api('/profile', 'POST', Object.assign({ solo: SOLO }, S.user));
     toast('Saved ✅');
+    if (SOLO && tg) setTimeout(() => tg.close(), 700);
   } catch (e) { toast(e.message, true); }
   btn.disabled = false;
 }

@@ -286,7 +286,12 @@ const menuKeyboard = (uid) => {
     [btn('👥 Customers', 'custs:0'), btn('📂 My Documents', 'hist')],
     [btn('🏢 Business Profile', 'prof'), btn('🎨 Templates', 'tpls')],
   ];
-  if (WEBAPP_URL) rows.push([Markup.button.webApp('🗂 Open Manager (forms)', `${WEBAPP_URL}/manage`)]);
+  if (WEBAPP_URL) {
+    // Tapping these opens the form straight away (no screen of one-by-one buttons)
+    const w = (label, tab) => Markup.button.webApp(label, `${WEBAPP_URL}/manage?tab=${tab}&solo=1`);
+    rows[1] = [w('👥 Customers', 'customers'), w('📂 My Documents', 'docs')];
+    rows[2] = [w('🏢 Business Profile', 'profile'), btn('🎨 Templates', 'tpls')];
+  }
   rows.push(isAdmin(uid) ? [btn('ℹ️ Help', 'help')] : [btn('⭐ Upgrade', 'up'), btn('ℹ️ Help', 'help')]);
   return Markup.inlineKeyboard(rows);
 };
@@ -566,7 +571,7 @@ bot.action('hist', async (ctx) => {
   const rows = r.rows.map((d) => [
     btn(`${d.number} · ₦${money(d.total)} · ${fmtDate(d.created_at)}`, `doc:view:${d.id}`),
   ]);
-  if (WEBAPP_URL) rows.push([Markup.button.webApp('📥 Open downloads page', `${WEBAPP_URL}/manage?tab=docs`)]);
+  if (WEBAPP_URL) rows.push([Markup.button.webApp('📥 Open downloads page', `${WEBAPP_URL}/manage?tab=docs&solo=1`)]);
   rows.push([btn('⬅️ Back', 'menu')]);
   const note = pro
     ? 'Your last 10 documents. Tap one to get the PDF again.'
@@ -605,7 +610,7 @@ async function showCustomerList(ctx, page, mode) {
   if (page > 0) nav.push(btn('◀️ Prev', `${prefix}:${page - 1}`));
   if ((page + 1) * PAGE < cnt) nav.push(btn('Next ▶️', `${prefix}:${page + 1}`));
   if (nav.length) rows.push(nav);
-  if (WEBAPP_URL && !mode) rows.push([Markup.button.webApp('➕ Add / edit in form', `${WEBAPP_URL}/manage?tab=customers`)]);
+  if (WEBAPP_URL && !mode) rows.push([Markup.button.webApp('➕ Add / edit in form', `${WEBAPP_URL}/manage?tab=customers&solo=1`)]);
   rows.push([btn('⬅️ Back', mode ? `new:${mode}` : 'menu')]);
   let text;
   if (!cnt) {
@@ -818,7 +823,7 @@ async function showProfile(ctx) {
     `Logo: ${u.has_logo ? 'uploaded' : 'none'}${pro ? '' : ' 🔒'}\n` +
     `Brand colour: #${u.accent}${pro ? '' : ' 🔒'}`;
   const rows = [];
-  if (WEBAPP_URL) rows.push([Markup.button.webApp('📝 Edit in form', `${WEBAPP_URL}/manage?tab=profile`)]);
+  if (WEBAPP_URL) rows.push([Markup.button.webApp('📝 Edit in form', `${WEBAPP_URL}/manage?tab=profile&solo=1`)]);
   rows.push(
     [btn('Name', 'prof:name'), btn('Phone', 'prof:phone'), btn('Address', 'prof:addr')],
     [btn(`${lock}Bank details`, 'prof:bank'), btn(`${lock}Logo`, 'prof:logo')],
@@ -1292,6 +1297,11 @@ app.post('/api/profile', wrap(async (req, res, { tg, pro }) => {
     `UPDATE users SET ${cols.map((c, i) => `${c} = $${i + 2}`).join(', ')} WHERE tg_id = $1`,
     [tg.id, ...cols.map((c) => sets[c])]
   );
+  if (b.solo) {
+    bot.telegram
+      .sendMessage(tg.id, '✅ Business profile saved.', opts(menuKeyboard(tg.id)))
+      .catch((e) => console.error('notify failed:', e && e.message));
+  }
   res.json({ ok: true });
 }));
 
