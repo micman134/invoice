@@ -68,6 +68,34 @@ async function retry(fn, tries = 3) {
 }
 const sendPdf = (ctx, buf, filename, extra = {}) =>
   retry(() => ctx.replyWithDocument({ source: buf, filename }, extra));
+// Direct download links (work even if the server cannot upload files to Telegram)
+const DL_KEY = crypto.createHash('sha256').update(`dl:${BOT_TOKEN}`).digest();
+const dlSig = (p) => crypto.createHmac('sha256', DL_KEY).update(p).digest('base64url');
+function dlUrl(base, tgId, docId) {
+  const p = `${tgId}.${docId}.${Date.now() + 10 * 60 * 1000}`;
+  return `${base}/dl/${Buffer.from(p).toString('base64url')}.${dlSig(p)}`;
+}
+function dlParse(token) {
+  const [b, sig] = String(token).split('.');
+  if (!b || !sig) return null;
+  const p = Buffer.from(b, 'base64url').toString();
+  const good = dlSig(p);
+  if (sig.length !== good.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(good))) return null;
+  const [tgId, docId, exp] = p.split('.').map(Number);
+  if (!tgId || !docId || Date.now() > exp) return null;
+  return { tgId, docId };
+}
+// Try Telegram upload; if it still fails, give the user a direct download button instead
+async function sendPdfSafe(ctx, buf, filename, extra, docId) {
+  try {
+    return await sendPdf(ctx, buf, filename, extra);
+  } catch (e) {
+    console.error('sendDocument failed:', e && e.message);
+    if (!WEBAPP_URL || !docId) throw e;
+    const kb = Markup.inlineKeyboard([[Markup.button.url('⬇️ Download PDF', dlUrl(WEBAPP_URL, ctx.from.id, docId))]]);
+    await ctx.reply('Telegram could not deliver the file just now. Tap below to download it directly (link valid 10 minutes).', opts(kb));
+  }
+}
 const sendPdfTo = (chatId, buf, filename, extra = {}) =>
   retry(() => bot.telegram.sendDocument(chatId, { source: buf, filename }, extra));
 const states = new Map(); // tgId -> { step, mode, draft }
@@ -538,8 +566,8 @@ bot.action('doc:gen', async (ctx) => {
     template,
   };
   const total = sumItems(d.items);
-  await pool.query(
-    'INSERT INTO documents (tg_id, kind, number, data, total, customer_id) VALUES ($1, $2, $3, $4, $5, $6)',
+  const ins = await pool.query(
+    'INSERT INTO documents (tg_id, kind, number, data, total, customer_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
     [id, st.mode, number, JSON.stringify(docData), total, customerId]
   );
 
@@ -551,7 +579,7 @@ bot.action('doc:gen', async (ctx) => {
   } catch (e) {
     /* ignore */
   }
-  await sendPdf(ctx, buf, `${number}.pdf`, { caption: `${number} · ₦${money(total)}` });
+  await sendPdfSafe(ctx, buf, `${number}.pdf`, { caption: `${number} · ₦${money(total)}` }, ins.rows[0].id);
   await showMenu(ctx, true);
 });
 
@@ -589,7 +617,7 @@ bot.action(/^doc:view:(\d+)$/, async (ctx) => {
   const logo = pro && user.has_logo ? await getLogo(id) : null;
   const doc = r.rows[0].data;
   const buf = await buildPdf({ user, logo, pro, doc, botName: BOT_NAME });
-  await sendPdf(ctx, buf, `${doc.number}.pdf`);
+  await sendPdfSafe(ctx, buf, `${doc.number}.pdf`, {}, Number(ctx.match[1]));
 });
 
 // ───────────────────────── Customers (Pro) ─────────────────────────
@@ -1384,9 +1412,46 @@ app.post('/api/docs/:id/send', wrap(async (req, res, { tg, u, pro }) => {
   const doc = r.rows[0].data;
   const logo = pro && u.has_logo ? await getLogo(tg.id) : null;
   const buf = await buildPdf({ user: u, logo, pro, doc, botName: BOT_NAME });
-  await sendPdfTo(tg.id, buf, `${doc.number}.pdf`, { caption: `${doc.number} · ₦${money(r.rows[0].total)}` });
+  try {
+    await sendPdfTo(tg.id, buf, `${doc.number}.pdf`, { caption: `${doc.number} · ₦${money(r.rows[0].total)}` });
+  } catch (e) {
+    console.error('sendDocument failed:', e && e.message);
+    return res.status(502).json({ error: 'Telegram could not deliver the file.', fallback: true });
+  }
   res.json({ ok: true });
 }));
+
+app.post('/api/docs/:id/link', wrap(async (req, res, { tg }) => {
+  const did = Number(req.params.id);
+  if (!Number.isInteger(did)) return res.status(400).json({ error: 'Bad request' });
+  const r = await pool.query('SELECT 1 FROM documents WHERE id = $1 AND tg_id = $2', [did, tg.id]);
+  if (!r.rowCount) return res.status(404).json({ error: 'Document not found.' });
+  res.json({ url: dlUrl(WEBAPP_URL || `https://${req.get('host')}`, tg.id, did) });
+}));
+
+// Direct PDF download via short-lived signed link
+app.get('/dl/:token', async (req, res) => {
+  try {
+    const t = dlParse(req.params.token);
+    if (!t) return res.status(403).send('This link is invalid or has expired. Open the bot and try again.');
+    const u = await getUser(t.tgId);
+    const r = await pool.query('SELECT data FROM documents WHERE id = $1 AND tg_id = $2', [t.docId, t.tgId]);
+    if (!u || !r.rowCount) return res.sendStatus(404);
+    const pro = isPro(u);
+    const logo = pro && u.has_logo ? await getLogo(t.tgId) : null;
+    const doc = r.rows[0].data;
+    const buf = await buildPdf({ user: u, logo, pro, doc, botName: BOT_NAME });
+    res.set({
+      'Content-Type': 'application/pdf',
+      'Content-Disposition': `attachment; filename="${String(doc.number).replace(/[^\w.-]/g, '_')}.pdf"`,
+      'Cache-Control': 'no-store',
+    });
+    res.send(buf);
+  } catch (e) {
+    console.error('download error:', e && e.message);
+    res.sendStatus(500);
+  }
+});
 
 app.post('/paystack/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   const sig = req.headers['x-paystack-signature'];
