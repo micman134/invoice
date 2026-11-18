@@ -1,10 +1,11 @@
 require('dotenv').config();
+const path = require('path');
 const { Telegraf, Markup } = require('telegraf');
 const { Pool } = require('pg');
-const PDFDocument = require('pdfkit');
 const axios = require('axios');
 const express = require('express');
 const crypto = require('crypto');
+const { buildPdf, TEMPLATES, money, sumItems } = require('./pdf');
 
 // ───────────────────────── Config ─────────────────────────
 const { BOT_TOKEN, DATABASE_URL, PAYSTACK_SECRET, PGSSL } = process.env;
@@ -16,6 +17,13 @@ if (!BOT_TOKEN || !DATABASE_URL) {
 const FREE_LIMIT = parseInt(process.env.FREE_LIMIT || '5', 10);
 const PORT = process.env.PORT || 3000;
 const EMAIL_DOMAIN = process.env.PAYSTACK_EMAIL_DOMAIN || 'invoicebot.app';
+// Public HTTPS address of this server. Enables the data-entry form (Telegram Mini App).
+const WEBAPP_URL = (process.env.WEBAPP_URL || '').replace(/\/$/, '');
+// Comma separated Telegram user IDs that get every Pro feature for free
+const ADMIN_IDS = (process.env.ADMIN_IDS || '')
+  .split(',')
+  .map((s) => Number(s.trim()))
+  .filter(Boolean);
 let BOT_NAME = process.env.BOT_NAME || 'InvoiceBot';
 
 const PLANS = {
@@ -74,20 +82,33 @@ async function initDb() {
       amount INT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT now()
     );
+    CREATE TABLE IF NOT EXISTS customers (
+      id SERIAL PRIMARY KEY,
+      tg_id BIGINT NOT NULL,
+      name TEXT NOT NULL,
+      name_key TEXT NOT NULL,
+      phone TEXT,
+      created_at TIMESTAMPTZ DEFAULT now(),
+      last_used TIMESTAMPTZ DEFAULT now(),
+      UNIQUE (tg_id, name_key)
+    );
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS template TEXT DEFAULT 'classic';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS cust_synced BOOLEAN DEFAULT false;
+    ALTER TABLE documents ADD COLUMN IF NOT EXISTS customer_id INT;
+    CREATE INDEX IF NOT EXISTS documents_cust_idx ON documents (tg_id, customer_id);
   `);
 }
 
 async function upsertUser(from) {
   await pool.query(
-    `INSERT INTO users (tg_id, first_name) VALUES ($1, $2)
-     ON CONFLICT (tg_id) DO NOTHING`,
+    `INSERT INTO users (tg_id, first_name) VALUES ($1, $2) ON CONFLICT (tg_id) DO NOTHING`,
     [from.id, from.first_name || null]
   );
 }
 
 async function getUser(id) {
   const r = await pool.query(
-    `SELECT tg_id, first_name, biz_name, phone, address, bank, accent,
+    `SELECT tg_id, first_name, biz_name, phone, address, bank, accent, template,
             (logo IS NOT NULL) AS has_logo, inv_seq, rec_seq, plan_expires
      FROM users WHERE tg_id = $1`,
     [id]
@@ -110,12 +131,41 @@ async function monthCount(id) {
   return r.rows[0].n;
 }
 
-const isPro = (u) => !!(u && u.plan_expires && new Date(u.plan_expires) > new Date());
+const isAdmin = (id) => ADMIN_IDS.includes(Number(id));
+const isPro = (u) =>
+  !!u && (isAdmin(u.tg_id) || !!(u.plan_expires && new Date(u.plan_expires) > new Date()));
+
+// Builds the customer list from past documents the first time a Pro user opens Customers
+async function syncCustomers(id) {
+  const flag = await pool.query(
+    'UPDATE users SET cust_synced = true WHERE tg_id = $1 AND cust_synced = false RETURNING 1',
+    [id]
+  );
+  if (!flag.rowCount) return;
+  await pool.query(
+    `INSERT INTO customers (tg_id, name, name_key, phone, last_used)
+     SELECT $1,
+            (array_agg(data->>'customer' ORDER BY created_at DESC))[1],
+            lower(data->>'customer'),
+            (array_agg(data->>'customerPhone' ORDER BY created_at DESC))[1],
+            max(created_at)
+     FROM documents
+     WHERE tg_id = $1 AND data->>'customer' IS NOT NULL
+     GROUP BY lower(data->>'customer')
+     ON CONFLICT (tg_id, name_key) DO NOTHING`,
+    [id]
+  );
+  await pool.query(
+    `UPDATE documents d SET customer_id = c.id
+     FROM customers c
+     WHERE d.tg_id = $1 AND c.tg_id = d.tg_id
+       AND c.name_key = lower(d.data->>'customer') AND d.customer_id IS NULL`,
+    [id]
+  );
+}
 
 // ───────────────────────── Helpers ─────────────────────────
 const esc = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-const money = (n) =>
-  Number(n).toLocaleString('en-NG', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 const fmtDate = (d) =>
   new Date(d).toLocaleDateString('en-GB', {
     timeZone: 'Africa/Lagos',
@@ -123,9 +173,9 @@ const fmtDate = (d) =>
     month: 'short',
     year: 'numeric',
   });
-const sumItems = (items) => items.reduce((t, i) => t + i.qty * i.price, 0);
 const btn = Markup.button.callback;
 const opts = (kb) => ({ parse_mode: 'HTML', reply_markup: kb.reply_markup });
+const cap = (s) => (s ? s.charAt(0).toUpperCase() + s.slice(1) : s);
 
 // Edit the current message when a button was pressed, otherwise send a new one
 async function show(ctx, text, kb) {
@@ -134,7 +184,7 @@ async function show(ctx, text, kb) {
       await ctx.editMessageText(text, opts(kb));
       return;
     } catch (e) {
-      // message not editable or unchanged, fall through and send a new one
+      // not editable (e.g. a document message) - send a new message instead
     }
   }
   await ctx.reply(text, opts(kb));
@@ -143,16 +193,11 @@ async function show(ctx, text, kb) {
 // "2 bags rice 45000" -> { name: 'Bags rice', qty: 2, price: 45000 }  (price is per unit)
 function parseLine(line) {
   const tokens = line.replace(/,/g, '').trim().split(/\s+/);
-  if (tokens.length < 2) {
-    // allow a single token like "delivery" only if it has no price -> invalid
-    return null;
-  }
-  const last = tokens[tokens.length - 1];
-  const pm = last.match(/^[₦N]?(\d+(?:\.\d+)?)(k)?$/i);
+  if (tokens.length < 2) return null;
+  const pm = tokens[tokens.length - 1].match(/^[₦N]?(\d+(?:\.\d+)?)(k)?$/i);
   if (!pm) return null;
   const price = parseFloat(pm[1]) * (pm[2] ? 1000 : 1);
   if (!(price > 0)) return null;
-
   const rest = tokens.slice(0, -1);
   let qty = 1;
   const qm = rest[0].match(/^(\d+(?:\.\d+)?)x?$/i);
@@ -162,7 +207,7 @@ function parseLine(line) {
   }
   const name = rest.join(' ').slice(0, 80);
   if (!name) return null;
-  return { name: name.charAt(0).toUpperCase() + name.slice(1), qty, price };
+  return { name: cap(name), qty, price };
 }
 
 function parseItems(text) {
@@ -178,153 +223,53 @@ function parseItems(text) {
   return { items: items.slice(0, 30), bad };
 }
 
-// ───────────────────────── PDF ─────────────────────────
-function buildPdf({ user, logo, pro, doc }) {
-  return new Promise((resolve, reject) => {
-    const pdf = new PDFDocument({
-      size: 'A4',
-      margins: { top: 50, left: 50, right: 50, bottom: 40 },
-    });
-    const chunks = [];
-    pdf.on('data', (c) => chunks.push(c));
-    pdf.on('end', () => resolve(Buffer.concat(chunks)));
-    pdf.on('error', reject);
-
-    const accent = pro ? `#${user.accent || '1f3a5f'}` : '#333333';
-    const grey = '#666666';
-    const isInvoice = doc.kind === 'invoice';
-    const L = 50;
-    const R = 545;
-    const body = () => pdf.font('Helvetica').fontSize(10).fillColor('#000000');
-
-    // Header: logo + business details (left), title + number/date (right)
-    let textX = L;
-    if (pro && logo) {
-      try {
-        pdf.image(logo, L, 45, { fit: [80, 60] });
-        textX = L + 95;
-      } catch (e) {
-        /* ignore unreadable logo */
-      }
-    }
-    pdf.fillColor(accent).font('Helvetica-Bold').fontSize(18)
-      .text(user.biz_name || user.first_name || 'My Business', textX, 50, { width: 250 });
-    pdf.fillColor(grey).font('Helvetica').fontSize(9);
-    if (user.phone) pdf.text(user.phone, textX, pdf.y + 2, { width: 250 });
-    if (user.address) pdf.text(user.address, textX, pdf.y + 2, { width: 250 });
-    const leftEnd = pdf.y;
-
-    pdf.fillColor(accent).font('Helvetica-Bold').fontSize(26)
-      .text(isInvoice ? 'INVOICE' : 'RECEIPT', 300, 50, { width: R - 300, align: 'right' });
-    pdf.fillColor(grey).font('Helvetica').fontSize(10);
-    pdf.text(`No: ${doc.number}`, 300, 84, { width: R - 300, align: 'right' });
-    pdf.text(`Date: ${doc.date}`, 300, 98, { width: R - 300, align: 'right' });
-    if (isInvoice && doc.due) {
-      pdf.text(`Due: ${doc.due}`, 300, 112, { width: R - 300, align: 'right' });
-    }
-
-    let y = Math.max(leftEnd, 130) + 15;
-    pdf.moveTo(L, y).lineTo(R, y).lineWidth(1).strokeColor('#dddddd').stroke();
-
-    // Customer
-    pdf.fillColor(grey).font('Helvetica').fontSize(9)
-      .text(isInvoice ? 'BILL TO' : 'RECEIVED FROM', L, y + 12);
-    pdf.fillColor('#000000').font('Helvetica-Bold').fontSize(13)
-      .text(doc.customer, L, pdf.y + 2, { width: 300 });
-
-    // Table header
-    const ty = pdf.y + 20;
-    pdf.rect(L, ty, R - L, 22).fill(accent);
-    pdf.fillColor('#ffffff').font('Helvetica-Bold').fontSize(10);
-    pdf.text('ITEM', 58, ty + 6, { width: 230 });
-    pdf.text('QTY', 295, ty + 6, { width: 45, align: 'right' });
-    pdf.text('PRICE', 345, ty + 6, { width: 95, align: 'right' });
-    pdf.text('AMOUNT', 445, ty + 6, { width: 95, align: 'right' });
-
-    // Rows
-    y = ty + 32;
-    body();
-    for (const it of doc.items) {
-      const h = pdf.heightOfString(it.name, { width: 230 });
-      if (y + h > 730) {
-        pdf.addPage();
-        y = 50;
-        body();
-      }
-      pdf.text(it.name, 58, y, { width: 230 });
-      pdf.text(String(it.qty), 295, y, { width: 45, align: 'right' });
-      pdf.text(money(it.price), 345, y, { width: 95, align: 'right' });
-      pdf.text(money(it.qty * it.price), 445, y, { width: 95, align: 'right' });
-      y += h + 8;
-      pdf.moveTo(L, y - 4).lineTo(R, y - 4).lineWidth(0.5).strokeColor('#eeeeee').stroke();
-    }
-
-    // Total
-    if (y > 700) {
-      pdf.addPage();
-      y = 50;
-    }
-    y += 8;
-    const total = sumItems(doc.items);
-    pdf.fillColor('#000000').font('Helvetica-Bold').fontSize(11);
-    pdf.text('TOTAL', 300, y, { width: 105, align: 'right' });
-    pdf.text(`NGN ${money(total)}`, 410, y, { width: 135, align: 'right' });
-
-    if (!isInvoice) {
-      pdf.save();
-      pdf.rotate(-10, { origin: [L + 50, y + 10] });
-      pdf.roundedRect(L, y - 6, 100, 34, 4).lineWidth(2).strokeColor('#1b7a4b').stroke();
-      pdf.fillColor('#1b7a4b').font('Helvetica-Bold').fontSize(20)
-        .text('PAID', L, y + 1, { width: 100, align: 'center' });
-      pdf.restore();
-    }
-
-    y += 50;
-    if (y > 700) {
-      pdf.addPage();
-      y = 50;
-    }
-
-    // Notes
-    if (doc.note) {
-      pdf.fillColor(grey).font('Helvetica-Bold').fontSize(9).text('NOTES', L, y);
-      body();
-      pdf.text(doc.note, L, pdf.y + 2, { width: 320 });
-      y = pdf.y + 16;
-    }
-
-    // Payment details (Pro, invoices only)
-    if (isInvoice && pro && user.bank) {
-      if (y > 700) {
-        pdf.addPage();
-        y = 50;
-      }
-      pdf.fillColor(grey).font('Helvetica-Bold').fontSize(9).text('PAYMENT DETAILS', L, y);
-      body();
-      pdf.text(user.bank, L, pdf.y + 2, { width: 320 });
-    }
-
-    // Footer (Free plan)
-    if (!pro) {
-      pdf.fillColor('#999999').font('Helvetica').fontSize(8)
-        .text(`Created with @${BOT_NAME}`, L, 785, { width: R - L, align: 'center' });
-    }
-
-    pdf.end();
-  });
+function formatDue(v) {
+  const s = String(v || '').trim().slice(0, 40);
+  if (!s) return { due: null, raw: null };
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return { due: fmtDate(new Date(`${s}T12:00:00Z`)), raw: s };
+  return { due: s, raw: s };
 }
 
+const SAMPLE_USER = {
+  first_name: 'Your Business',
+  biz_name: 'Your Business',
+  phone: '0800 000 0000',
+  address: 'Lagos, Nigeria',
+  accent: '1f3a5f',
+  bank: 'Your Bank · 0123456789 · Your Business',
+};
+const sampleDoc = (template) => ({
+  kind: 'invoice',
+  number: 'INV-0001',
+  date: fmtDate(new Date()),
+  customer: 'Sample Customer',
+  customerPhone: '0801 234 5678',
+  items: [
+    { name: 'Product one', qty: 2, price: 15000 },
+    { name: 'Product two', qty: 1, price: 8500 },
+    { name: 'Delivery', qty: 1, price: 2000 },
+  ],
+  due: '14 days',
+  note: 'Thank you for your business.',
+  template,
+});
+
 // ───────────────────────── Keyboards & screens ─────────────────────────
-const menuKeyboard = () =>
-  Markup.inlineKeyboard([
+const menuKeyboard = (uid) => {
+  const rows = [
     [btn('🧾 New Invoice', 'new:invoice'), btn('💵 New Receipt', 'new:receipt')],
-    [btn('📂 My Documents', 'hist'), btn('🏢 Business Profile', 'prof')],
-    [btn('⭐ Upgrade', 'up'), btn('ℹ️ Help', 'help')],
-  ]);
+    [btn('👥 Customers', 'custs:0'), btn('📂 My Documents', 'hist')],
+    [btn('🏢 Business Profile', 'prof'), btn('🎨 Templates', 'tpls')],
+  ];
+  rows.push(isAdmin(uid) ? [btn('ℹ️ Help', 'help')] : [btn('⭐ Upgrade', 'up'), btn('ℹ️ Help', 'help')]);
+  return Markup.inlineKeyboard(rows);
+};
 
 const cancelKeyboard = (to = 'menu') => Markup.inlineKeyboard([[btn('❌ Cancel', to)]]);
+const backToMenu = () => Markup.inlineKeyboard([[btn('⬅️ Menu', 'menu')]]);
 
 async function statusLine(u) {
+  if (isAdmin(u.tg_id)) return '👑 Admin · all features unlocked';
   if (isPro(u)) return `⭐ Pro active until ${fmtDate(u.plan_expires)}`;
   const n = await monthCount(u.tg_id);
   return `Free plan · ${n}/${FREE_LIMIT} documents used this month`;
@@ -334,8 +279,8 @@ async function showMenu(ctx, fresh = false) {
   states.delete(ctx.from.id);
   const u = await getUser(ctx.from.id);
   const text = `<b>🧾 Invoice &amp; Receipt Bot</b>\nCreate professional PDF invoices and receipts in seconds.\n\n${await statusLine(u)}\n\nWhat would you like to do?`;
-  if (fresh) await ctx.reply(text, opts(menuKeyboard()));
-  else await show(ctx, text, menuKeyboard());
+  if (fresh) await ctx.reply(text, opts(menuKeyboard(ctx.from.id)));
+  else await show(ctx, text, menuKeyboard(ctx.from.id));
 }
 
 async function showUpgrade(ctx, intro) {
@@ -346,7 +291,9 @@ async function showUpgrade(ctx, intro) {
   const text =
     `${intro ? intro + '\n\n' : ''}<b>⭐ Pro plan</b>\n` +
     `• Unlimited invoices &amp; receipts\n` +
-    `• Your logo, brand colour and bank details on invoices\n` +
+    `• Saved customers and one-tap repeat invoices\n` +
+    `• 5 document templates\n` +
+    `• Your logo, brand colour and bank details\n` +
     `• No "Created with" footer\n` +
     `• Longer document history\n\n` +
     `Choose a plan:`;
@@ -356,23 +303,27 @@ async function showUpgrade(ctx, intro) {
 function previewText(st) {
   const d = st.draft;
   const lines = d.items.map(
-    (i) => `• ${esc(i.name)} — ${i.qty} × ${money(i.price)} = ${money(i.qty * i.price)}`
+    (i) => `• ${esc(i.name)}: ${i.qty} × ${money(i.price)} = ${money(i.qty * i.price)}`
   );
   let t =
     `<b>${st.mode === 'invoice' ? 'Invoice' : 'Receipt'} preview</b>\n` +
-    `Customer: <b>${esc(d.customer)}</b>\n\n${lines.join('\n')}\n\n` +
+    `Customer: <b>${esc(d.customer)}</b>${d.phone ? ` · ${esc(d.phone)}` : ''}\n\n${lines.join('\n')}\n\n` +
     `Total: <b>₦${money(sumItems(d.items))}</b>`;
   if (d.due) t += `\nDue: ${esc(d.due)}`;
   if (d.note) t += `\nNote: ${esc(d.note)}`;
+  t += `\nTemplate: ${TEMPLATES[d.template] ? TEMPLATES[d.template].name : 'Classic'}`;
   return t;
 }
 
 function previewKeyboard(st) {
-  const rows = [
-    [btn('✅ Generate PDF', 'doc:gen')],
-    [btn('✏️ Edit items', 'doc:items'), btn('📝 Note', 'doc:note')],
-  ];
-  if (st.mode === 'invoice') rows.push([btn('📅 Due date', 'doc:due')]);
+  const rows = [[btn('✅ Generate PDF', 'doc:gen')]];
+  if (WEBAPP_URL) {
+    rows.push([Markup.button.webApp('✏️ Edit in form', `${WEBAPP_URL}/form?mode=${st.mode}&edit=1`)]);
+  } else {
+    rows.push([btn('✏️ Edit items', 'doc:items'), btn('📝 Note', 'doc:note')]);
+    if (st.mode === 'invoice') rows.push([btn('📅 Due date', 'doc:due')]);
+  }
+  rows.push([btn('🎨 Template', 'doc:tpl')]);
   rows.push([btn('❌ Cancel', 'menu')]);
   return Markup.inlineKeyboard(rows);
 }
@@ -387,7 +338,7 @@ const ITEMS_HELP =
   `Price is <b>per unit</b>. Examples:\n` +
   `<code>2 bags rice 45000\n1 carton oil 38k\ndelivery 5000</code>`;
 
-// ───────────────────────── Middleware ─────────────────────────
+// ───────────────────────── Middleware & basics ─────────────────────────
 bot.use(async (ctx, next) => {
   if (ctx.from) await upsertUser(ctx.from);
   return next();
@@ -401,20 +352,54 @@ bot.action('menu', async (ctx) => {
   await showMenu(ctx);
 });
 
-// ───────────────────────── New document flow ─────────────────────────
-bot.action(/^new:(invoice|receipt)$/, async (ctx) => {
-  await ctx.answerCbQuery();
+// ───────────────────────── New document ─────────────────────────
+async function startNew(ctx, mode, cust) {
   const id = ctx.from.id;
   const u = await getUser(id);
-  if (!isPro(u) && (await monthCount(id)) >= FREE_LIMIT) {
+  const pro = isPro(u);
+  if (!pro && (await monthCount(id)) >= FREE_LIMIT) {
     return showUpgrade(ctx, `You've used all ${FREE_LIMIT} free documents this month.`);
   }
-  states.set(id, { step: 'customer', mode: ctx.match[1], draft: { items: [] } });
-  await show(
-    ctx,
-    `<b>New ${ctx.match[1]}</b>\nWho is it for? Send the customer's name.`,
-    cancelKeyboard()
-  );
+  const draft = { items: [], template: pro ? u.template || 'classic' : 'classic' };
+  if (cust) {
+    draft.customer = cust.name;
+    draft.phone = cust.phone || null;
+    draft.customerId = cust.id;
+  }
+  states.set(id, { step: WEBAPP_URL ? 'form' : cust ? 'items' : 'customer', mode, draft });
+
+  if (WEBAPP_URL) {
+    const url = `${WEBAPP_URL}/form?mode=${mode}${cust ? `&c=${cust.id}` : ''}`;
+    const rows = [[Markup.button.webApp('📝 Open form', url)]];
+    if (pro && !cust) rows.push([btn('👥 Pick saved customer', `pick:${mode}:0`)]);
+    rows.push([btn('⌨️ Type instead', 'typed')], [btn('❌ Cancel', 'menu')]);
+    return show(
+      ctx,
+      `<b>New ${mode}</b>${cust ? `\nCustomer: <b>${esc(cust.name)}</b>` : ''}\nTap <b>Open form</b> to fill in the details.`,
+      Markup.inlineKeyboard(rows)
+    );
+  }
+  if (cust) {
+    return show(ctx, `<b>New ${mode}</b> for <b>${esc(cust.name)}</b>\n\n${ITEMS_HELP}`, cancelKeyboard());
+  }
+  return show(ctx, `<b>New ${mode}</b>\nWho is it for? Send the customer's name.`, cancelKeyboard());
+}
+
+bot.action(/^new:(invoice|receipt)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await startNew(ctx, ctx.match[1], null);
+});
+
+bot.action('typed', async (ctx) => {
+  await ctx.answerCbQuery();
+  const st = states.get(ctx.from.id);
+  if (!st) return showMenu(ctx);
+  if (st.draft.customer) {
+    st.step = 'items';
+    return show(ctx, ITEMS_HELP, cancelKeyboard());
+  }
+  st.step = 'customer';
+  return show(ctx, `<b>New ${st.mode}</b>\nWho is it for? Send the customer's name.`, cancelKeyboard());
 });
 
 bot.action('doc:items', async (ctx) => {
@@ -441,16 +426,66 @@ bot.action('doc:note', async (ctx) => {
   await show(ctx, 'Type the note to show on the document (max 200 characters).', cancelKeyboard());
 });
 
+// Template choice for the document being created
+bot.action('doc:tpl', async (ctx) => {
+  await ctx.answerCbQuery();
+  const st = states.get(ctx.from.id);
+  if (!st) return showMenu(ctx);
+  const pro = isPro(await getUser(ctx.from.id));
+  const rows = Object.entries(TEMPLATES).map(([k, t]) => [
+    btn(`${st.draft.template === k ? '✅ ' : ''}${!pro && !t.free ? '🔒 ' : ''}${t.name}`, `doc:tpl:${k}`),
+  ]);
+  rows.push([btn('⬅️ Back', 'doc:back')]);
+  await show(ctx, 'Choose a template for this document:', Markup.inlineKeyboard(rows));
+});
+
+bot.action(/^doc:tpl:(\w+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const st = states.get(ctx.from.id);
+  if (!st) return showMenu(ctx);
+  const key = ctx.match[1];
+  const t = TEMPLATES[key];
+  if (!t) return showPreview(ctx, st);
+  if (!t.free && !isPro(await getUser(ctx.from.id))) {
+    return showUpgrade(ctx, 'This template is a Pro feature.');
+  }
+  st.draft.template = key;
+  await showPreview(ctx, st);
+});
+
+bot.action('doc:back', async (ctx) => {
+  await ctx.answerCbQuery();
+  const st = states.get(ctx.from.id);
+  if (!st) return showMenu(ctx);
+  await showPreview(ctx, st);
+});
+
 bot.action('doc:gen', async (ctx) => {
   await ctx.answerCbQuery('Generating…');
   const id = ctx.from.id;
   const st = states.get(id);
-  if (!st || !st.draft.items.length) return showMenu(ctx);
+  if (!st || !st.draft.items.length || !st.draft.customer) return showMenu(ctx);
 
   const user = await getUser(id);
   const pro = isPro(user);
   if (!pro && (await monthCount(id)) >= FREE_LIMIT) {
     return showUpgrade(ctx, `You've used all ${FREE_LIMIT} free documents this month.`);
+  }
+
+  const d = st.draft;
+  const template = pro && TEMPLATES[d.template] ? d.template : 'classic';
+
+  // Pro: remember the customer
+  let customerId = null;
+  if (pro) {
+    const cr = await pool.query(
+      `INSERT INTO customers (tg_id, name, name_key, phone) VALUES ($1, $2, $3, $4)
+       ON CONFLICT (tg_id, name_key)
+       DO UPDATE SET last_used = now(), phone = COALESCE(EXCLUDED.phone, customers.phone)
+       RETURNING id`,
+      [id, d.customer, d.customer.toLowerCase(), d.phone || null]
+    );
+    customerId = cr.rows[0].id;
   }
 
   const col = st.mode === 'invoice' ? 'inv_seq' : 'rec_seq';
@@ -460,24 +495,25 @@ bot.action('doc:gen', async (ctx) => {
     [id]
   );
   const number = `${prefix}-${String(r.rows[0].n).padStart(4, '0')}`;
-  const d = st.draft;
   const docData = {
     kind: st.mode,
     number,
     date: fmtDate(new Date()),
     customer: d.customer,
+    customerPhone: d.phone || null,
     items: d.items,
     due: d.due || null,
     note: d.note || null,
+    template,
   };
   const total = sumItems(d.items);
   await pool.query(
-    'INSERT INTO documents (tg_id, kind, number, data, total) VALUES ($1, $2, $3, $4, $5)',
-    [id, st.mode, number, JSON.stringify(docData), total]
+    'INSERT INTO documents (tg_id, kind, number, data, total, customer_id) VALUES ($1, $2, $3, $4, $5, $6)',
+    [id, st.mode, number, JSON.stringify(docData), total, customerId]
   );
 
   const logo = pro && user.has_logo ? await getLogo(id) : null;
-  const buf = await buildPdf({ user, logo, pro, doc: docData });
+  const buf = await buildPdf({ user, logo, pro, doc: docData, botName: BOT_NAME });
   states.delete(id);
   try {
     await ctx.editMessageReplyMarkup(undefined);
@@ -496,19 +532,21 @@ bot.action('hist', async (ctx) => {
   await ctx.answerCbQuery();
   states.delete(ctx.from.id);
   const u = await getUser(ctx.from.id);
-  const limit = isPro(u) ? 10 : 3;
+  const pro = isPro(u);
   const r = await pool.query(
     'SELECT id, number, total, created_at FROM documents WHERE tg_id = $1 ORDER BY created_at DESC LIMIT $2',
-    [ctx.from.id, limit]
+    [ctx.from.id, pro ? 10 : 3]
   );
   if (!r.rowCount) {
-    return show(ctx, 'No documents yet. Create your first one!', Markup.inlineKeyboard([[btn('⬅️ Back', 'menu')]]));
+    return show(ctx, 'No documents yet. Create your first one!', backToMenu());
   }
   const rows = r.rows.map((d) => [
     btn(`${d.number} · ₦${money(d.total)} · ${fmtDate(d.created_at)}`, `doc:view:${d.id}`),
   ]);
   rows.push([btn('⬅️ Back', 'menu')]);
-  const note = isPro(u) ? 'Your last 10 documents. Tap one to get the PDF again.' : 'Your last 3 documents (Pro keeps 10). Tap one to get the PDF again.';
+  const note = pro
+    ? 'Your last 10 documents. Tap one to get the PDF again.'
+    : 'Your last 3 documents (Pro keeps 10). Tap one to get the PDF again.';
   await show(ctx, `<b>📂 My Documents</b>\n${note}`, Markup.inlineKeyboard(rows));
 });
 
@@ -521,8 +559,223 @@ bot.action(/^doc:view:(\d+)$/, async (ctx) => {
   const pro = isPro(user);
   const logo = pro && user.has_logo ? await getLogo(id) : null;
   const doc = r.rows[0].data;
-  const buf = await buildPdf({ user, logo, pro, doc });
+  const buf = await buildPdf({ user, logo, pro, doc, botName: BOT_NAME });
   await ctx.replyWithDocument({ source: buf, filename: `${doc.number}.pdf` });
+});
+
+// ───────────────────────── Customers (Pro) ─────────────────────────
+async function showCustomerList(ctx, page, mode) {
+  const id = ctx.from.id;
+  if (!isPro(await getUser(id))) return showUpgrade(ctx, 'Saved customers are a Pro feature.');
+  states.delete(id);
+  await syncCustomers(id);
+  const PAGE = 8;
+  const cnt = (await pool.query('SELECT count(*)::int AS n FROM customers WHERE tg_id = $1', [id])).rows[0].n;
+  const r = await pool.query(
+    'SELECT id, name FROM customers WHERE tg_id = $1 ORDER BY last_used DESC LIMIT $2 OFFSET $3',
+    [id, PAGE, page * PAGE]
+  );
+  const prefix = mode ? `pick:${mode}` : 'custs';
+  const rows = r.rows.map((c) => [btn(c.name.slice(0, 40), mode ? `cnew:${mode}:${c.id}` : `cust:${c.id}`)]);
+  const nav = [];
+  if (page > 0) nav.push(btn('◀️ Prev', `${prefix}:${page - 1}`));
+  if ((page + 1) * PAGE < cnt) nav.push(btn('Next ▶️', `${prefix}:${page + 1}`));
+  if (nav.length) rows.push(nav);
+  rows.push([btn('⬅️ Back', mode ? `new:${mode}` : 'menu')]);
+  let text;
+  if (!cnt) {
+    text = '<b>👥 Customers</b>\nNo customers yet. They are saved automatically each time you create a document.';
+  } else if (mode) {
+    text = `<b>Choose a customer</b> (${cnt})`;
+  } else {
+    text = `<b>👥 Customers</b> (${cnt})\nTap a customer to create a new document, repeat their last one, or see their history.`;
+  }
+  await show(ctx, text, Markup.inlineKeyboard(rows));
+}
+
+bot.action(/^custs:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await showCustomerList(ctx, Number(ctx.match[1]), null);
+});
+
+bot.action(/^pick:(invoice|receipt):(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  await showCustomerList(ctx, Number(ctx.match[2]), ctx.match[1]);
+});
+
+async function getCustomer(id, cid) {
+  const r = await pool.query('SELECT id, name, phone FROM customers WHERE id = $1 AND tg_id = $2', [cid, id]);
+  return r.rows[0];
+}
+
+bot.action(/^cust:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = ctx.from.id;
+  if (!isPro(await getUser(id))) return showUpgrade(ctx, 'Saved customers are a Pro feature.');
+  const c = await getCustomer(id, ctx.match[1]);
+  if (!c) return showCustomerList(ctx, 0, null);
+  const s = (
+    await pool.query(
+      'SELECT count(*)::int AS n, max(created_at) AS last FROM documents WHERE tg_id = $1 AND customer_id = $2',
+      [id, c.id]
+    )
+  ).rows[0];
+  const text =
+    `<b>${esc(c.name)}</b>\n` +
+    (c.phone ? `Phone: ${esc(c.phone)}\n` : '') +
+    `Documents: ${s.n}` +
+    (s.last ? `\nLast document: ${fmtDate(s.last)}` : '');
+  const kb = Markup.inlineKeyboard([
+    [btn('🧾 New invoice', `cnew:invoice:${c.id}`), btn('💵 New receipt', `cnew:receipt:${c.id}`)],
+    [btn('🔁 Repeat last document', `crepeat:${c.id}`)],
+    [btn('📄 Their documents', `cdocs:${c.id}`)],
+    [btn('🗑 Remove customer', `cdel:${c.id}`)],
+    [btn('⬅️ Back', 'custs:0')],
+  ]);
+  await show(ctx, text, kb);
+});
+
+bot.action(/^cnew:(invoice|receipt):(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const c = await getCustomer(ctx.from.id, ctx.match[2]);
+  if (!c) return showCustomerList(ctx, 0, null);
+  await startNew(ctx, ctx.match[1], c);
+});
+
+bot.action(/^crepeat:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = ctx.from.id;
+  const u = await getUser(id);
+  if (!isPro(u)) return showUpgrade(ctx, 'Saved customers are a Pro feature.');
+  const c = await getCustomer(id, ctx.match[1]);
+  if (!c) return showCustomerList(ctx, 0, null);
+  const r = await pool.query(
+    'SELECT data FROM documents WHERE tg_id = $1 AND customer_id = $2 ORDER BY created_at DESC LIMIT 1',
+    [id, c.id]
+  );
+  if (!r.rowCount) {
+    return show(ctx, 'No documents for this customer yet.', Markup.inlineKeyboard([[btn('⬅️ Back', `cust:${c.id}`)]]));
+  }
+  const last = r.rows[0].data;
+  const st = {
+    step: 'preview',
+    mode: last.kind,
+    draft: {
+      customer: c.name,
+      phone: c.phone || last.customerPhone || null,
+      customerId: c.id,
+      items: last.items,
+      due: null,
+      note: last.note || null,
+      template: u.template || last.template || 'classic',
+    },
+  };
+  states.set(id, st);
+  await showPreview(ctx, st);
+});
+
+bot.action(/^cdocs:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const id = ctx.from.id;
+  const c = await getCustomer(id, ctx.match[1]);
+  if (!c) return showCustomerList(ctx, 0, null);
+  const r = await pool.query(
+    'SELECT id, number, total, created_at FROM documents WHERE tg_id = $1 AND customer_id = $2 ORDER BY created_at DESC LIMIT 8',
+    [id, c.id]
+  );
+  const rows = r.rows.map((d) => [
+    btn(`${d.number} · ₦${money(d.total)} · ${fmtDate(d.created_at)}`, `doc:view:${d.id}`),
+  ]);
+  rows.push([btn('⬅️ Back', `cust:${c.id}`)]);
+  await show(
+    ctx,
+    r.rowCount ? `<b>${esc(c.name)}</b>: tap a document to get the PDF again.` : 'No documents for this customer yet.',
+    Markup.inlineKeyboard(rows)
+  );
+});
+
+bot.action(/^cdel:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const c = await getCustomer(ctx.from.id, ctx.match[1]);
+  if (!c) return showCustomerList(ctx, 0, null);
+  await show(
+    ctx,
+    `Remove <b>${esc(c.name)}</b> from your customers? Their documents stay in your history.`,
+    Markup.inlineKeyboard([[btn('Yes, remove', `cdel:yes:${c.id}`)], [btn('Cancel', `cust:${c.id}`)]])
+  );
+});
+
+bot.action(/^cdel:yes:(\d+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Removed');
+  const id = ctx.from.id;
+  await pool.query('UPDATE documents SET customer_id = NULL WHERE tg_id = $1 AND customer_id = $2', [id, ctx.match[1]]);
+  await pool.query('DELETE FROM customers WHERE tg_id = $1 AND id = $2', [id, ctx.match[1]]);
+  await showCustomerList(ctx, 0, null);
+});
+
+// ───────────────────────── Templates ─────────────────────────
+async function showTemplates(ctx) {
+  const u = await getUser(ctx.from.id);
+  const pro = isPro(u);
+  const current = pro ? u.template || 'classic' : 'classic';
+  const keys = Object.keys(TEMPLATES);
+  const rows = [];
+  for (let i = 0; i < keys.length; i += 2) {
+    rows.push(
+      keys.slice(i, i + 2).map((k) => {
+        const t = TEMPLATES[k];
+        return btn(`${current === k ? '✅ ' : ''}${!pro && !t.free ? '🔒 ' : ''}${t.name}`, `tpl:view:${k}`);
+      })
+    );
+  }
+  rows.push([btn('⬅️ Back', 'menu')]);
+  await show(
+    ctx,
+    `<b>🎨 Templates</b>\nYour default: <b>${TEMPLATES[current].name}</b>\nTap a template to see a sample PDF.` +
+      (pro ? '' : '\n🔒 = Pro'),
+    Markup.inlineKeyboard(rows)
+  );
+}
+
+bot.action('tpls', async (ctx) => {
+  await ctx.answerCbQuery();
+  states.delete(ctx.from.id);
+  await showTemplates(ctx);
+});
+
+bot.action(/^tpl:view:(\w+)$/, async (ctx) => {
+  await ctx.answerCbQuery('Preparing sample…');
+  const key = ctx.match[1];
+  const t = TEMPLATES[key];
+  if (!t) return showTemplates(ctx);
+  const id = ctx.from.id;
+  const u = await getUser(id);
+  const pro = isPro(u);
+  const user = pro ? u : SAMPLE_USER;
+  const logo = pro && u.has_logo ? await getLogo(id) : null;
+  const buf = await buildPdf({ user, logo, pro: true, sample: true, doc: sampleDoc(key), botName: BOT_NAME });
+  const allowed = pro || t.free;
+  const kb = Markup.inlineKeyboard([
+    [allowed ? btn(`✅ Use ${t.name} as default`, `tpl:set:${key}`) : btn('⭐ Upgrade to unlock', 'up')],
+    [btn('⬅️ All templates', 'tpls')],
+  ]);
+  await ctx.replyWithDocument(
+    { source: buf, filename: `sample-${key}.pdf` },
+    { caption: `${t.name} template (sample)`, reply_markup: kb.reply_markup }
+  );
+});
+
+bot.action(/^tpl:set:(\w+)$/, async (ctx) => {
+  const key = ctx.match[1];
+  const t = TEMPLATES[key];
+  const u = await getUser(ctx.from.id);
+  if (!t || (!t.free && !isPro(u))) {
+    await ctx.answerCbQuery();
+    return showUpgrade(ctx, 'This template is a Pro feature.');
+  }
+  await ctx.answerCbQuery('Saved');
+  await pool.query('UPDATE users SET template = $2 WHERE tg_id = $1', [ctx.from.id, key]);
+  await ctx.reply(`✅ ${t.name} is now your default template.`, opts(Markup.inlineKeyboard([[btn('🎨 Templates', 'tpls'), btn('⬅️ Menu', 'menu')]])));
 });
 
 // ───────────────────────── Business profile ─────────────────────────
@@ -602,7 +855,7 @@ bot.on('photo', async (ctx) => {
   const id = ctx.from.id;
   const st = states.get(id);
   if (!st || st.step !== 'prof_logo') {
-    return ctx.reply('To set a logo, open Business Profile → Logo first.', opts(menuKeyboard()));
+    return ctx.reply('To set a logo, open Business Profile → Logo first.', opts(menuKeyboard(id)));
   }
   const photos = ctx.message.photo;
   const link = await ctx.telegram.getFileLink(photos[photos.length - 1].file_id);
@@ -617,7 +870,7 @@ bot.action('del', async (ctx) => {
   await ctx.answerCbQuery();
   await show(
     ctx,
-    '<b>Delete all your data?</b>\nThis removes your profile, logo and all saved documents. Payment records are kept for accounting. This cannot be undone.',
+    '<b>Delete all your data?</b>\nThis removes your profile, logo, customers and all saved documents. Payment records are kept for accounting. This cannot be undone.',
     Markup.inlineKeyboard([[btn('Yes, delete everything', 'del:yes')], [btn('Cancel', 'prof')]])
   );
 });
@@ -626,6 +879,7 @@ bot.action('del:yes', async (ctx) => {
   await ctx.answerCbQuery();
   const id = ctx.from.id;
   await pool.query('DELETE FROM documents WHERE tg_id = $1', [id]);
+  await pool.query('DELETE FROM customers WHERE tg_id = $1', [id]);
   await pool.query('DELETE FROM users WHERE tg_id = $1', [id]);
   states.delete(id);
   await show(ctx, 'Your data has been deleted. Send /start to begin again.', Markup.inlineKeyboard([]));
@@ -638,10 +892,11 @@ bot.action('help', async (ctx) => {
     ctx,
     `<b>ℹ️ How it works</b>\n` +
       `1. Tap <b>New Invoice</b> or <b>New Receipt</b>\n` +
-      `2. Send the customer's name\n` +
-      `3. Send the items, one per line\n` +
-      `4. Check the preview, then tap <b>Generate PDF</b>\n\n` +
-      `${ITEMS_HELP}\n\n` +
+      (WEBAPP_URL
+        ? `2. Tap <b>Open form</b>, fill in the customer and items, then tap Preview\n`
+        : `2. Send the customer's name, then the items, one per line\n`) +
+      `3. Check the preview, pick a template if you like, and tap <b>Generate PDF</b>\n\n` +
+      (WEBAPP_URL ? '' : `${ITEMS_HELP}\n\n`) +
       `Set your business name, phone and address under <b>Business Profile</b>.`,
     Markup.inlineKeyboard([[btn('⬅️ Back', 'menu')]])
   );
@@ -665,11 +920,10 @@ async function activate(tgId, planKey, reference, amountKobo) {
   return 'ok';
 }
 
-const backToMenu = () => Markup.inlineKeyboard([[btn('⬅️ Menu', 'menu')]]);
-
 bot.action('up', async (ctx) => {
   await ctx.answerCbQuery();
   const u = await getUser(ctx.from.id);
+  if (isAdmin(u.tg_id)) return show(ctx, '👑 You are an admin: every feature is already unlocked.', backToMenu());
   await showUpgrade(ctx, isPro(u) ? `You're on Pro until ${fmtDate(u.plan_expires)}. Buying again extends it.` : '');
 });
 
@@ -793,15 +1047,131 @@ bot.on('text', async (ctx) => {
 bot.catch(async (err, ctx) => {
   console.error('Bot error', err);
   try {
-    await ctx.reply('Something went wrong. Please try again.', opts(menuKeyboard()));
+    await ctx.reply('Something went wrong. Please try again.', opts(menuKeyboard(ctx.from && ctx.from.id)));
   } catch (e) {
     /* ignore */
   }
 });
 
-// ───────────────────────── Web server (Paystack webhook) ─────────────────────────
+// ───────────────────────── Web server: form (Mini App) + Paystack webhook ─────────────────────────
 const app = express();
 app.get('/', (req, res) => res.send('Invoice bot is running'));
+
+app.get('/form', (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.sendFile(path.join(__dirname, 'public', 'form.html'));
+});
+
+// Validates Telegram Mini App initData and returns the Telegram user (or null)
+function verifyInitData(initData) {
+  if (!initData) return null;
+  const params = new URLSearchParams(initData);
+  const hash = params.get('hash');
+  if (!hash) return null;
+  params.delete('hash');
+  const check = [...params.entries()]
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+  const secret = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+  const calc = crypto.createHmac('sha256', secret).update(check).digest('hex');
+  if (calc.length !== hash.length || !crypto.timingSafeEqual(Buffer.from(calc), Buffer.from(hash))) return null;
+  const authDate = Number(params.get('auth_date'));
+  if (!authDate || Date.now() / 1000 - authDate > 86400) return null;
+  try {
+    return JSON.parse(params.get('user'));
+  } catch (e) {
+    return null;
+  }
+}
+
+app.use('/api', express.json({ limit: '100kb' }));
+
+app.get('/api/init', async (req, res) => {
+  try {
+    const tg = verifyInitData(req.get('X-Init-Data'));
+    if (!tg) return res.status(401).json({ error: 'unauthorized' });
+    const u = await getUser(tg.id);
+    if (!u) return res.status(404).json({ error: 'Open the bot and send /start first.' });
+    const pro = isPro(u);
+    const out = { pro, customers: [], customer: null, draft: null, mode: null };
+    if (pro) {
+      const r = await pool.query(
+        'SELECT name, phone FROM customers WHERE tg_id = $1 ORDER BY last_used DESC LIMIT 200',
+        [tg.id]
+      );
+      out.customers = r.rows;
+      const cid = Number(req.query.c);
+      if (cid) {
+        const c = await getCustomer(tg.id, cid);
+        if (c) out.customer = { name: c.name, phone: c.phone };
+      }
+    }
+    const st = states.get(tg.id);
+    if (req.query.edit && st && st.draft && st.draft.items) {
+      out.mode = st.mode;
+      out.draft = {
+        customer: st.draft.customer,
+        phone: st.draft.phone || '',
+        items: st.draft.items,
+        due: st.draft.dueRaw || '',
+        note: st.draft.note || '',
+      };
+    }
+    res.json(out);
+  } catch (e) {
+    console.error('init error', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/submit', async (req, res) => {
+  try {
+    const tg = verifyInitData(req.get('X-Init-Data'));
+    if (!tg) return res.status(401).json({ error: 'unauthorized' });
+    const id = tg.id;
+    const u = await getUser(id);
+    if (!u) return res.status(404).json({ error: 'Open the bot and send /start first.' });
+
+    const b = req.body || {};
+    const mode = b.mode === 'receipt' ? 'receipt' : 'invoice';
+    const customer = String(b.customer || '').trim().slice(0, 80);
+    const items = (Array.isArray(b.items) ? b.items : [])
+      .slice(0, 30)
+      .map((i) => ({
+        name: cap(String((i && i.name) || '').trim().slice(0, 80)),
+        qty: Number(i && i.qty),
+        price: Number(i && i.price),
+      }))
+      .filter((i) => i.name && isFinite(i.qty) && i.qty > 0 && isFinite(i.price) && i.price > 0);
+    if (!customer) return res.status(400).json({ error: 'Please enter the customer name.' });
+    if (!items.length) return res.status(400).json({ error: 'Please add at least one item with a price.' });
+
+    const pro = isPro(u);
+    const prev = states.get(id);
+    const { due, raw } = formatDue(b.due);
+    const st = {
+      step: 'preview',
+      mode,
+      draft: {
+        customer,
+        phone: String(b.phone || '').trim().slice(0, 30) || null,
+        items,
+        due,
+        dueRaw: raw,
+        note: String(b.note || '').trim().slice(0, 200) || null,
+        template:
+          (prev && prev.draft && prev.draft.template) || (pro ? u.template || 'classic' : 'classic'),
+      },
+    };
+    states.set(id, st);
+    await bot.telegram.sendMessage(id, previewText(st), opts(previewKeyboard(st)));
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('submit error', e);
+    res.status(500).json({ error: 'Server error' });
+  }
+});
 
 app.post('/paystack/webhook', express.raw({ type: '*/*' }), async (req, res) => {
   const sig = req.headers['x-paystack-signature'];
@@ -823,7 +1193,7 @@ app.post('/paystack/webhook', express.raw({ type: '*/*' }), async (req, res) => 
     if (!tgId) return;
     const r = await activate(tgId, d.metadata.plan, d.reference, d.amount);
     if (r === 'ok') {
-      await bot.telegram.sendMessage(tgId, '✅ Payment received! Pro is now active.', opts(menuKeyboard()));
+      await bot.telegram.sendMessage(tgId, '✅ Payment received! Pro is now active.', opts(menuKeyboard(tgId)));
     }
   } catch (e) {
     console.error('Webhook error', e);
@@ -840,7 +1210,7 @@ app.post('/paystack/webhook', express.raw({ type: '*/*' }), async (req, res) => 
     console.error('Launch failed', e);
     process.exit(1);
   });
-  console.log(`Bot @${BOT_NAME} started`);
+  console.log(`Bot @${BOT_NAME} started${WEBAPP_URL ? ` · form at ${WEBAPP_URL}/form` : ' · form disabled (no WEBAPP_URL)'}`);
 })();
 
 process.once('SIGINT', () => bot.stop('SIGINT'));

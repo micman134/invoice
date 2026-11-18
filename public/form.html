@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>Invoice form</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --text: var(--tg-theme-text-color, #111111);
+    --hint: var(--tg-theme-hint-color, #7a7a7a);
+    --card: var(--tg-theme-secondary-bg-color, #f2f3f5);
+    --btn: var(--tg-theme-button-color, #2481cc);
+    --btntext: var(--tg-theme-button-text-color, #ffffff);
+    --line: rgba(127, 127, 127, 0.25);
+    --err: #d93025;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px 16px 110px; background: var(--bg); color: var(--text);
+         font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  h1 { font-size: 20px; margin: 0 0 14px; }
+  label.cap { display: block; font-size: 13px; color: var(--hint); margin: 14px 0 6px; }
+  input, textarea, select { width: 100%; padding: 12px; font-size: 16px; color: var(--text);
+         background: var(--card); border: 1px solid var(--line); border-radius: 10px; outline: none; }
+  input:focus, textarea:focus, select:focus { border-color: var(--btn); }
+  textarea { resize: none; min-height: 64px; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .item { background: var(--card); border-radius: 12px; padding: 10px; margin-bottom: 10px; border: 1px solid var(--line); }
+  .item input { background: var(--bg); }
+  .item .name { margin-bottom: 8px; }
+  .item .nums { display: grid; grid-template-columns: 80px 1fr; gap: 8px; }
+  .item .foot { display: flex; justify-content: space-between; align-items: center; margin-top: 8px; font-size: 14px; color: var(--hint); }
+  .rm { background: none; border: none; color: var(--err); font-size: 14px; padding: 4px 6px; cursor: pointer; }
+  .add { width: 100%; padding: 12px; border: 1px dashed var(--btn); color: var(--btn); background: none;
+         border-radius: 10px; font-size: 16px; cursor: pointer; }
+  .bar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--bg); border-top: 1px solid var(--line);
+         padding: 10px 16px calc(10px + env(safe-area-inset-bottom, 0px)); }
+  .total { display: flex; justify-content: space-between; font-weight: 600; margin-bottom: 8px; }
+  .go { width: 100%; padding: 14px; font-size: 17px; font-weight: 600; border: none; border-radius: 12px;
+        background: var(--btn); color: var(--btntext); cursor: pointer; }
+  .go:disabled { opacity: 0.6; }
+  .msg { color: var(--err); font-size: 14px; min-height: 18px; margin-bottom: 6px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+  <h1 id="title">New invoice</h1>
+
+  <label class="cap" for="customer">Customer name</label>
+  <input id="customer" list="custlist" placeholder="e.g. Chioma Okafor" autocomplete="off" maxlength="80">
+  <datalist id="custlist"></datalist>
+
+  <label class="cap" for="phone">Customer phone (optional)</label>
+  <input id="phone" type="tel" inputmode="tel" placeholder="0801 234 5678" maxlength="30">
+
+  <label class="cap">Items</label>
+  <div id="items"></div>
+  <button class="add" id="addItem" type="button">+ Add item</button>
+
+  <div id="dueBox">
+    <label class="cap" for="dueSel">Due date</label>
+    <select id="dueSel">
+      <option value="">No due date</option>
+      <option value="On receipt">On receipt</option>
+      <option value="7">In 7 days</option>
+      <option value="14">In 14 days</option>
+      <option value="30">In 30 days</option>
+      <option value="pick">Pick a date…</option>
+    </select>
+    <input id="dueDate" type="date" class="hidden" style="margin-top:8px">
+  </div>
+
+  <label class="cap" for="note">Note (optional)</label>
+  <textarea id="note" maxlength="200" placeholder="e.g. Thank you for your business"></textarea>
+
+  <div class="bar">
+    <div class="msg" id="msg"></div>
+    <div class="total"><span>Total</span><span id="total">₦0</span></div>
+    <button class="go" id="go" type="button">Preview</button>
+  </div>
+
+<script>
+(function () {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  if (tg) { tg.ready(); tg.expand(); }
+  var params = new URLSearchParams(location.search);
+  var mode = params.get('mode') === 'receipt' ? 'receipt' : 'invoice';
+  var initData = tg ? tg.initData : '';
+  var $ = function (id) { return document.getElementById(id); };
+  var phoneByName = {};
+
+  function parseNum(v) {
+    var s = String(v == null ? '' : v).replace(/[,₦\s]/g, '').toLowerCase();
+    var m = s.match(/^(\d+(?:\.\d+)?)(k)?$/);
+    return m ? parseFloat(m[1]) * (m[2] ? 1000 : 1) : NaN;
+  }
+  function fmt(n) { return Number(n).toLocaleString('en-NG', { maximumFractionDigits: 2 }); }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+
+  function setMode(m) {
+    mode = m;
+    $('title').textContent = mode === 'receipt' ? 'New receipt' : 'New invoice';
+    $('dueBox').classList.toggle('hidden', mode === 'receipt');
+  }
+
+  function recalc() {
+    var total = 0;
+    document.querySelectorAll('.item').forEach(function (row) {
+      var q = parseNum(row.querySelector('.qty').value);
+      var p = parseNum(row.querySelector('.price').value);
+      var line = (q > 0 && p > 0) ? q * p : 0;
+      row.querySelector('.line').textContent = line ? '₦' + fmt(line) : '';
+      total += line;
+    });
+    $('total').textContent = '₦' + fmt(total);
+  }
+
+  function addRow(item, focus) {
+    var row = document.createElement('div');
+    row.className = 'item';
+    row.innerHTML =
+      '<input class="name" placeholder="Item (e.g. Bag of rice)" maxlength="80">' +
+      '<div class="nums"><input class="qty" inputmode="decimal" placeholder="Qty">' +
+      '<input class="price" inputmode="decimal" placeholder="Price each (e.g. 45000 or 38k)"></div>' +
+      '<div class="foot"><span class="line"></span><button type="button" class="rm">Remove</button></div>';
+    row.querySelector('.name').value = item && item.name ? item.name : '';
+    row.querySelector('.qty').value = item && item.qty ? item.qty : 1;
+    row.querySelector('.price').value = item && item.price ? item.price : '';
+    row.addEventListener('input', recalc);
+    row.querySelector('.rm').addEventListener('click', function () {
+      if (document.querySelectorAll('.item').length > 1) { row.remove(); recalc(); }
+      else { row.querySelector('.name').value = ''; row.querySelector('.price').value = ''; row.querySelector('.qty').value = 1; recalc(); }
+    });
+    $('items').appendChild(row);
+    if (focus) row.querySelector('.name').focus();
+    recalc();
+  }
+
+  $('addItem').addEventListener('click', function () { addRow(null, true); });
+  $('dueSel').addEventListener('change', function () {
+    $('dueDate').classList.toggle('hidden', $('dueSel').value !== 'pick');
+  });
+  $('customer').addEventListener('input', function () {
+    var p = phoneByName[$('customer').value.toLowerCase()];
+    if (p && !$('phone').value) $('phone').value = p;
+  });
+
+  function dueValue() {
+    var v = $('dueSel').value;
+    if (!v) return '';
+    if (v === 'pick') return $('dueDate').value || '';
+    if (/^\d+$/.test(v)) {
+      var d = new Date(); d.setDate(d.getDate() + Number(v));
+      return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate());
+    }
+    return v;
+  }
+
+  function setDue(v) {
+    if (!v) return;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(v)) { $('dueSel').value = 'pick'; $('dueDate').value = v; $('dueDate').classList.remove('hidden'); }
+    else if (v === 'On receipt') { $('dueSel').value = 'On receipt'; }
+  }
+
+  function showMsg(t) { $('msg').textContent = t || ''; }
+
+  $('go').addEventListener('click', function () {
+    showMsg('');
+    var customer = $('customer').value.trim();
+    if (!customer) { showMsg('Please enter the customer name.'); $('customer').focus(); return; }
+    var items = [];
+    var bad = false;
+    document.querySelectorAll('.item').forEach(function (row) {
+      var name = row.querySelector('.name').value.trim();
+      var qRaw = row.querySelector('.qty').value;
+      var pRaw = row.querySelector('.price').value;
+      if (!name && !String(pRaw).trim()) return;           // empty row, skip
+      var q = parseNum(qRaw), p = parseNum(pRaw);
+      if (!name || !(q > 0) || !(p > 0)) { bad = true; return; }
+      items.push({ name: name, qty: q, price: p });
+    });
+    if (bad) { showMsg('Each item needs a name, a quantity and a price.'); return; }
+    if (!items.length) { showMsg('Add at least one item.'); return; }
+
+    $('go').disabled = true; $('go').textContent = 'Sending…';
+    fetch('/api/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Init-Data': initData },
+      body: JSON.stringify({
+        mode: mode, customer: customer, phone: $('phone').value.trim(),
+        items: items, due: mode === 'invoice' ? dueValue() : '', note: $('note').value.trim()
+      })
+    }).then(function (r) { return r.json().then(function (j) { return { ok: r.ok, j: j }; }); })
+      .then(function (res) {
+        if (!res.ok) throw new Error((res.j && res.j.error) || 'Something went wrong');
+        if (tg) tg.close();
+      })
+      .catch(function (e) {
+        showMsg(e.message);
+        $('go').disabled = false; $('go').textContent = 'Preview';
+      });
+  });
+
+  setMode(mode);
+  addRow(null, false);
+
+  fetch('/api/init?' + params.toString(), { headers: { 'X-Init-Data': initData } })
+    .then(function (r) { return r.ok ? r.json() : Promise.reject(); })
+    .then(function (d) {
+      if (d.mode) setMode(d.mode);
+      var dl = $('custlist');
+      (d.customers || []).forEach(function (c) {
+        phoneByName[c.name.toLowerCase()] = c.phone || '';
+        var o = document.createElement('option'); o.value = c.name; dl.appendChild(o);
+      });
+      if (d.customer) { $('customer').value = d.customer.name; $('phone').value = d.customer.phone || ''; }
+      if (d.draft) {
+        $('customer').value = d.draft.customer || '';
+        $('phone').value = d.draft.phone || '';
+        $('note').value = d.draft.note || '';
+        setDue(d.draft.due);
+        $('items').innerHTML = '';
+        (d.draft.items || []).forEach(function (it) { addRow(it, false); });
+        if (!(d.draft.items || []).length) addRow(null, false);
+      }
+    })
+    .catch(function () { /* form still works; saved customers just will not suggest */ });
+})();
+</script>
+</body>
+</html>
