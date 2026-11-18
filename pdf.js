@@ -12,6 +12,21 @@ const money = (n) =>
   Number(n).toLocaleString('en-NG', { minimumFractionDigits: 0, maximumFractionDigits: 2 });
 const sumItems = (items) => items.reduce((t, i) => t + i.qty * i.price, 0);
 
+// Optional taxes: VAT is added to the subtotal, WHT (withholding tax) is deducted from it.
+const rate = (v) => {
+  const n = Number(v);
+  return isFinite(n) && n > 0 && n <= 100 ? n : 0;
+};
+const r2 = (n) => Math.round(n * 100) / 100;
+function calcTotals(items, vatRate, whtRate) {
+  const subtotal = sumItems(items);
+  const vr = rate(vatRate);
+  const wr = rate(whtRate);
+  const vat = r2((subtotal * vr) / 100);
+  const wht = r2((subtotal * wr) / 100);
+  return { subtotal, vatRate: vr, whtRate: wr, vat, wht, total: r2(subtotal + vat - wht) };
+}
+
 function buildPdf({ user, logo, pro, doc, sample = false, botName = 'InvoiceBot' }) {
   return new Promise((resolve, reject) => {
     const tpl = pro && TEMPLATES[doc.template] ? doc.template : 'classic';
@@ -205,12 +220,24 @@ function buildPdf({ user, logo, pro, doc, sample = false, botName = 'InvoiceBot'
     }
 
     // ───────── Total ─────────
-    if (y > 690) {
+    const tt = calcTotals(doc.items, doc.vatRate, doc.whtRate);
+    const taxRows = [];
+    if (tt.vat || tt.wht) taxRows.push(['Subtotal', `NGN ${money(tt.subtotal)}`]);
+    if (tt.vat) taxRows.push([`VAT (${tt.vatRate}%)`, `NGN ${money(tt.vat)}`]);
+    if (tt.wht) taxRows.push([`WHT (${tt.whtRate}%)`, `- NGN ${money(tt.wht)}`]);
+    if (y + taxRows.length * 16 > 690) {
       pdf.addPage();
       y = 50;
     }
     y += 10;
-    const total = sumItems(doc.items);
+    for (const [label, value] of taxRows) {
+      pdf.fillColor(grey).font(FR).fontSize(10);
+      pdf.text(label, 300, y, { width: 105, align: 'right' });
+      pdf.text(value, 410, y, { width: 135, align: 'right' });
+      y += 16;
+    }
+    if (taxRows.length) y += 6;
+    const total = tt.total;
     if (tpl === 'bold') {
       pdf.roundedRect(300, y - 6, R - 300, 30, 4).fill(accent);
       pdf.fillColor('#ffffff').font(FB).fontSize(12);
@@ -284,4 +311,4 @@ function buildPdf({ user, logo, pro, doc, sample = false, botName = 'InvoiceBot'
   });
 }
 
-module.exports = { TEMPLATES, buildPdf, money, sumItems };
+module.exports = { TEMPLATES, buildPdf, money, sumItems, calcTotals };

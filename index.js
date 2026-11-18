@@ -6,7 +6,7 @@ const axios = require('axios');
 const express = require('express');
 const crypto = require('crypto');
 const https = require('https');
-const { buildPdf, TEMPLATES, money, sumItems } = require('./pdf');
+const { buildPdf, TEMPLATES, money, sumItems, calcTotals } = require('./pdf');
 
 // ───────────────────────── Config ─────────────────────────
 const { BOT_TOKEN, DATABASE_URL, PAYSTACK_SECRET, PGSSL } = process.env;
@@ -15,7 +15,8 @@ if (!BOT_TOKEN || !DATABASE_URL) {
   process.exit(1);
 }
 
-const FREE_LIMIT = parseInt(process.env.FREE_LIMIT || '5', 10);
+// Free plan: documents allowed per day (Lagos time). Set FREE_DAILY_LIMIT in .env to change it.
+const FREE_LIMIT = parseInt(process.env.FREE_DAILY_LIMIT || process.env.FREE_LIMIT || '5', 10);
 const PORT = process.env.PORT || 3000;
 const EMAIL_DOMAIN = process.env.PAYSTACK_EMAIL_DOMAIN || 'invoicebot.app';
 // Public HTTPS address of this server. Enables the data-entry form (Telegram Mini App).
@@ -96,8 +97,6 @@ async function sendPdfSafe(ctx, buf, filename, extra, docId) {
     await ctx.reply('Telegram could not deliver the file just now. Tap below to download it directly (link valid 10 minutes).', opts(kb));
   }
 }
-const sendPdfTo = (chatId, buf, filename, extra = {}) =>
-  retry(() => bot.telegram.sendDocument(chatId, { source: buf, filename }, extra));
 const states = new Map(); // tgId -> { step, mode, draft }
 
 // ───────────────────────── Database ─────────────────────────
@@ -173,11 +172,11 @@ async function getLogo(id) {
   return r.rows[0] ? r.rows[0].logo : null;
 }
 
-async function monthCount(id) {
+async function dayCount(id) {
   const r = await pool.query(
     `SELECT count(*)::int AS n FROM documents
      WHERE tg_id = $1
-       AND created_at >= date_trunc('month', now() AT TIME ZONE 'Africa/Lagos') AT TIME ZONE 'Africa/Lagos'`,
+       AND created_at >= date_trunc('day', now() AT TIME ZONE 'Africa/Lagos') AT TIME ZONE 'Africa/Lagos'`,
     [id]
   );
   return r.rows[0].n;
@@ -317,6 +316,10 @@ const menuKeyboard = (uid) => {
   if (WEBAPP_URL) {
     // Tapping these opens the form straight away (no screen of one-by-one buttons)
     const w = (label, tab) => Markup.button.webApp(label, `${WEBAPP_URL}/manage?tab=${tab}&solo=1`);
+    rows[0] = [
+      Markup.button.webApp('🧾 New Invoice', `${WEBAPP_URL}/form?mode=invoice`),
+      Markup.button.webApp('💵 New Receipt', `${WEBAPP_URL}/form?mode=receipt`),
+    ];
     rows[1] = [w('👥 Customers', 'customers'), w('📂 My Documents', 'docs')];
     rows[2] = [w('🏢 Business Profile', 'profile'), btn('🎨 Templates', 'tpls')];
   }
@@ -330,8 +333,8 @@ const backToMenu = () => Markup.inlineKeyboard([[btn('⬅️ Menu', 'menu')]]);
 async function statusLine(u) {
   if (isAdmin(u.tg_id)) return '👑 Admin · all features unlocked';
   if (isPro(u)) return `⭐ Pro active until ${fmtDate(u.plan_expires)}`;
-  const n = await monthCount(u.tg_id);
-  return `Free plan · ${n}/${FREE_LIMIT} documents used this month`;
+  const n = await dayCount(u.tg_id);
+  return `Free plan · ${n}/${FREE_LIMIT} documents used today`;
 }
 
 async function showMenu(ctx, fresh = false) {
@@ -359,6 +362,16 @@ async function showUpgrade(ctx, intro) {
   await show(ctx, text, Markup.inlineKeyboard(rows));
 }
 
+// Optional VAT / WHT lines for the chat preview
+function taxLines(d) {
+  const t = calcTotals(d.items, d.vatRate, d.whtRate);
+  if (!t.vat && !t.wht) return '';
+  let out = `Subtotal: ₦${money(t.subtotal)}\n`;
+  if (t.vat) out += `VAT (${t.vatRate}%): +₦${money(t.vat)}\n`;
+  if (t.wht) out += `WHT (${t.whtRate}%): −₦${money(t.wht)}\n`;
+  return out;
+}
+
 function previewText(st) {
   const d = st.draft;
   const lines = d.items.map(
@@ -367,7 +380,8 @@ function previewText(st) {
   let t =
     `<b>${st.mode === 'invoice' ? 'Invoice' : 'Receipt'} preview</b>\n` +
     `Customer: <b>${esc(d.customer)}</b>${d.phone ? ` · ${esc(d.phone)}` : ''}\n\n${lines.join('\n')}\n\n` +
-    `Total: <b>₦${money(sumItems(d.items))}</b>`;
+    taxLines(d) +
+    `Total: <b>₦${money(calcTotals(d.items, d.vatRate, d.whtRate).total)}</b>`;
   if (d.due) t += `\nDue: ${esc(d.due)}`;
   if (d.note) t += `\nNote: ${esc(d.note)}`;
   t += `\nTemplate: ${TEMPLATES[d.template] ? TEMPLATES[d.template].name : 'Classic'}`;
@@ -382,7 +396,7 @@ function previewKeyboard(st) {
     rows.push([btn('✏️ Edit items', 'doc:items'), btn('📝 Note', 'doc:note')]);
     if (st.mode === 'invoice') rows.push([btn('📅 Due date', 'doc:due')]);
   }
-  rows.push([btn('🎨 Template', 'doc:tpl')]);
+  rows.push([btn('💰 VAT / WHT (optional)', 'doc:tax'), btn('🎨 Template', 'doc:tpl')]);
   rows.push([btn('❌ Cancel', 'menu')]);
   return Markup.inlineKeyboard(rows);
 }
@@ -416,8 +430,8 @@ async function startNew(ctx, mode, cust) {
   const id = ctx.from.id;
   const u = await getUser(id);
   const pro = isPro(u);
-  if (!pro && (await monthCount(id)) >= FREE_LIMIT) {
-    return showUpgrade(ctx, `You've used all ${FREE_LIMIT} free documents this month.`);
+  if (!pro && (await dayCount(id)) >= FREE_LIMIT) {
+    return showUpgrade(ctx, `You've used all ${FREE_LIMIT} free documents for today. Your limit resets at midnight.`);
   }
   const draft = { items: [], template: pro ? u.template || 'classic' : 'classic' };
   if (cust) {
@@ -512,6 +526,67 @@ bot.action(/^doc:tpl:(\w+)$/, async (ctx) => {
   await showPreview(ctx, st);
 });
 
+// Optional VAT / WHT
+async function showTaxMenu(ctx, st) {
+  const d = st.draft;
+  const on = (kind, v) => (Number(d[`${kind}Rate`]) === v ? '✅ ' : '');
+  const customVat = d.vatRate && d.vatRate !== 7.5;
+  const customWht = d.whtRate && ![5, 10].includes(Number(d.whtRate));
+  const rows = [
+    [btn(`${on('vat', 7.5)}VAT 7.5%`, 'tax:vat:7.5'), btn(`${customVat ? '✅ ' : ''}Custom VAT`, 'tax:custom:vat')],
+    [btn(`${on('wht', 5)}WHT 5%`, 'tax:wht:5'), btn(`${on('wht', 10)}WHT 10%`, 'tax:wht:10')],
+    [btn(`${customWht ? '✅ ' : ''}Custom WHT`, 'tax:custom:wht')],
+    [btn('🚫 Remove VAT & WHT', 'tax:clear')],
+    [btn('⬅️ Back to preview', 'doc:back')],
+  ];
+  await show(
+    ctx,
+    `<b>💰 VAT / WHT</b> (optional)\n` +
+      `• <b>VAT</b> is added to the subtotal\n• <b>WHT</b> is deducted from the subtotal\n\n` +
+      `Current: VAT ${d.vatRate ? d.vatRate + '%' : 'none'} · WHT ${d.whtRate ? d.whtRate + '%' : 'none'}\n` +
+      `Tap a selected option again to turn it off.`,
+    Markup.inlineKeyboard(rows)
+  );
+}
+
+bot.action('doc:tax', async (ctx) => {
+  await ctx.answerCbQuery();
+  const st = states.get(ctx.from.id);
+  if (!st) return showMenu(ctx);
+  await showTaxMenu(ctx, st);
+});
+
+bot.action(/^tax:(vat|wht):(\d+(?:\.\d+)?)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const st = states.get(ctx.from.id);
+  if (!st) return showMenu(ctx);
+  const key = `${ctx.match[1]}Rate`;
+  const v = Number(ctx.match[2]);
+  st.draft[key] = Number(st.draft[key]) === v ? null : v;
+  await showTaxMenu(ctx, st);
+});
+
+bot.action('tax:clear', async (ctx) => {
+  await ctx.answerCbQuery();
+  const st = states.get(ctx.from.id);
+  if (!st) return showMenu(ctx);
+  st.draft.vatRate = null;
+  st.draft.whtRate = null;
+  await showTaxMenu(ctx, st);
+});
+
+bot.action(/^tax:custom:(vat|wht)$/, async (ctx) => {
+  await ctx.answerCbQuery();
+  const st = states.get(ctx.from.id);
+  if (!st) return showMenu(ctx);
+  st.step = `tax_${ctx.match[1]}`;
+  await show(
+    ctx,
+    `Type the ${ctx.match[1].toUpperCase()} rate in percent, e.g. <code>7.5</code>. Send <code>0</code> to remove it.`,
+    Markup.inlineKeyboard([[btn('⬅️ Back', 'doc:tax')]])
+  );
+});
+
 bot.action('doc:back', async (ctx) => {
   await ctx.answerCbQuery();
   const st = states.get(ctx.from.id);
@@ -527,8 +602,8 @@ bot.action('doc:gen', async (ctx) => {
 
   const user = await getUser(id);
   const pro = isPro(user);
-  if (!pro && (await monthCount(id)) >= FREE_LIMIT) {
-    return showUpgrade(ctx, `You've used all ${FREE_LIMIT} free documents this month.`);
+  if (!pro && (await dayCount(id)) >= FREE_LIMIT) {
+    return showUpgrade(ctx, `You've used all ${FREE_LIMIT} free documents for today. Your limit resets at midnight.`);
   }
 
   const d = st.draft;
@@ -564,8 +639,10 @@ bot.action('doc:gen', async (ctx) => {
     due: d.due || null,
     note: d.note || null,
     template,
+    vatRate: d.vatRate || null,
+    whtRate: d.whtRate || null,
   };
-  const total = sumItems(d.items);
+  const total = calcTotals(d.items, d.vatRate, d.whtRate).total;
   const ins = await pool.query(
     'INSERT INTO documents (tg_id, kind, number, data, total, customer_id) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id',
     [id, st.mode, number, JSON.stringify(docData), total, customerId]
@@ -725,6 +802,8 @@ bot.action(/^crepeat:(\d+)$/, async (ctx) => {
       items: last.items,
       due: null,
       note: last.note || null,
+      vatRate: last.vatRate || null,
+      whtRate: last.whtRate || null,
       template: u.template || last.template || 'classic',
     },
   };
@@ -1087,6 +1166,17 @@ bot.on('text', async (ctx) => {
       return ctx.reply(previewText(st), opts(previewKeyboard(st)));
     }
 
+    case 'tax_vat':
+    case 'tax_wht': {
+      const n = parseFloat(text.replace('%', '').replace(',', '.'));
+      if (!isFinite(n) || n < 0 || n > 100) {
+        return ctx.reply('Please send a number between 0 and 100, e.g. <code>7.5</code>.', opts(cancelKeyboard('doc:tax')));
+      }
+      st.draft[st.step === 'tax_vat' ? 'vatRate' : 'whtRate'] = n || null;
+      st.step = 'preview';
+      return ctx.reply(previewText(st), opts(previewKeyboard(st)));
+    }
+
     case 'due':
       st.draft.due = text.slice(0, 40);
       st.draft.dueRaw = st.draft.due;
@@ -1187,6 +1277,8 @@ app.get('/api/init', async (req, res) => {
         items: st.draft.items,
         due: st.draft.dueRaw || '',
         note: st.draft.note || '',
+        vat: st.draft.vatRate || '',
+        wht: st.draft.whtRate || '',
       };
     }
     res.json(out);
@@ -1219,6 +1311,11 @@ app.post('/api/submit', async (req, res) => {
     if (!items.length) return res.status(400).json({ error: 'Please add at least one item with a price.' });
 
     const pro = isPro(u);
+    if (!pro && (await dayCount(id)) >= FREE_LIMIT) {
+      return res.status(403).json({
+        error: `You've used all ${FREE_LIMIT} free documents for today. Your limit resets at midnight. Upgrade from the bot menu (⭐ Upgrade).`,
+      });
+    }
     const prev = states.get(id);
     const { due, raw } = formatDue(b.due);
     const st = {
@@ -1230,6 +1327,8 @@ app.post('/api/submit', async (req, res) => {
         items,
         due,
         dueRaw: raw,
+        vatRate: b.vat !== undefined ? Number(b.vat) || null : (prev && prev.draft && prev.draft.vatRate) || null,
+        whtRate: b.wht !== undefined ? Number(b.wht) || null : (prev && prev.draft && prev.draft.whtRate) || null,
         note: String(b.note || '').trim().slice(0, 200) || null,
         template:
           (prev && prev.draft && prev.draft.template) || (pro ? u.template || 'classic' : 'classic'),
@@ -1403,24 +1502,7 @@ app.delete('/api/customers/:id', wrap(async (req, res, a) => {
   res.json({ ok: true, customers: await listCustomers(a.tg.id) });
 }));
 
-// Downloads: the PDF is sent to the user's Telegram chat (reliable inside the Mini App)
-app.post('/api/docs/:id/send', wrap(async (req, res, { tg, u, pro }) => {
-  const did = Number(req.params.id);
-  if (!Number.isInteger(did)) return res.status(400).json({ error: 'Bad request' });
-  const r = await pool.query('SELECT data, total FROM documents WHERE id = $1 AND tg_id = $2', [did, tg.id]);
-  if (!r.rowCount) return res.status(404).json({ error: 'Document not found.' });
-  const doc = r.rows[0].data;
-  const logo = pro && u.has_logo ? await getLogo(tg.id) : null;
-  const buf = await buildPdf({ user: u, logo, pro, doc, botName: BOT_NAME });
-  try {
-    await sendPdfTo(tg.id, buf, `${doc.number}.pdf`, { caption: `${doc.number} · ₦${money(r.rows[0].total)}` });
-  } catch (e) {
-    console.error('sendDocument failed:', e && e.message);
-    return res.status(502).json({ error: 'Telegram could not deliver the file.', fallback: true });
-  }
-  res.json({ ok: true });
-}));
-
+// Downloads: signed direct link (opened in the phone's browser)
 app.post('/api/docs/:id/link', wrap(async (req, res, { tg }) => {
   const did = Number(req.params.id);
   if (!Number.isInteger(did)) return res.status(400).json({ error: 'Bad request' });

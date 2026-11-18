@@ -269,13 +269,13 @@ function docListHtml() {
         <b><span class="badge ${d.kind === 'receipt' ? 'rec' : ''}">${d.kind === 'receipt' ? 'REC' : 'INV'}</span>${esc(d.number)} · ${esc(d.customer || '')}</b>
         <span class="hint">${fdate(d.created_at)} · ₦${money(d.total)}</span>
       </div>
-      <div class="acts"><button class="ghost" data-act="dsend" data-id="${d.id}">📥 Chat</button><button class="ghost" data-act="dsave" data-id="${d.id}">⬇️ Save</button></div>
+      <button class="ghost" data-act="dsave" data-id="${d.id}">⬇️ Save</button>
     </div>`).join('');
 }
 
 function docsView() {
   return `
-    <p class="status"><b>📥 Chat</b> sends the PDF to your chat with the bot. <b>⬇️ Save</b> downloads it directly.${S.pro ? '' : ' Free plan shows your last 3 documents.'}</p>
+    <p class="status">Tap <b>⬇️ Save</b> to download the PDF.${S.pro ? '' : ' Free plan shows your last 3 documents.'}</p>
     <div class="row"><input id="dq" type="search" placeholder="Search by number or customer" value="${esc(dq)}"></div>
     <div id="dlist">${docListHtml()}</div>`;
 }
@@ -387,17 +387,6 @@ $('#view').addEventListener('click', async (e) => {
       case 'cinv': location.href = `/form?mode=invoice&c=${id}`; break;
       case 'crec': location.href = `/form?mode=receipt&c=${id}`; break;
 
-      case 'dsend':
-        el.disabled = true;
-        el.textContent = 'Sending…';
-        try {
-          await api(`/docs/${id}/send`, 'POST');
-          toast('Sent to your chat ✅');
-        } catch (err) {
-          toast('Chat delivery failed, downloading instead…', true);
-          await downloadDoc(id);
-        } finally { el.disabled = false; el.textContent = '📥 Chat'; }
-        break;
       case 'dsave': await downloadDoc(id); break;
     }
   } catch (err) { toast(err.message, true); }
