@@ -1623,6 +1623,18 @@ app.post('/paystack/webhook', express.raw({ type: '*/*' }), async (req, res) => 
   await initDb();
   const me = await retry(() => bot.telegram.getMe());
   BOT_NAME = me.username;
+  // Registers the "Menu" button next to the message box (shows on desktop and mobile)
+  try {
+    await retry(() =>
+      bot.telegram.setMyCommands([
+        { command: 'start', description: 'Open the main menu' },
+        { command: 'menu', description: 'Show the main menu' },
+      ])
+    );
+    await retry(() => bot.telegram.setChatMenuButton({ menuButton: { type: 'commands' } }));
+  } catch (e) {
+    console.error('menu button setup failed:', e && e.message);
+  }
   app.listen(PORT, () => console.log(`Web server on :${PORT}`));
   bot.launch().catch((e) => {
     console.error('Launch failed', e);
