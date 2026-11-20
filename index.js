@@ -157,6 +157,11 @@ async function initDb() {
       last_used TIMESTAMPTZ DEFAULT now(),
       UNIQUE (tg_id, name_key)
     );
+    CREATE TABLE IF NOT EXISTS bot_settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMPTZ DEFAULT now()
+    );
     ALTER TABLE users ADD COLUMN IF NOT EXISTS template TEXT DEFAULT 'classic';
     ALTER TABLE users ADD COLUMN IF NOT EXISTS cust_synced BOOLEAN DEFAULT false;
     ALTER TABLE documents ADD COLUMN IF NOT EXISTS customer_id INT;
@@ -198,8 +203,22 @@ async function dayCount(id) {
 
 const historyLimit = (pro) => (pro ? 10 : 3);
 const isAdmin = (id) => ADMIN_IDS.includes(Number(id));
+// FREE_MODE (admin switch): when on, every user gets all Pro features and no daily limit. Saved in the database.
+let FREE_MODE = false;
+async function loadSettings() {
+  const r = await pool.query("SELECT value FROM bot_settings WHERE key = 'free_mode'");
+  FREE_MODE = r.rows[0] ? r.rows[0].value === 'on' : String(process.env.FREE_MODE || '').toLowerCase() === 'true';
+}
+async function setFreeMode(on) {
+  await pool.query(
+    `INSERT INTO bot_settings (key, value) VALUES ('free_mode', $1)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+    [on ? 'on' : 'off']
+  );
+  FREE_MODE = on;
+}
 const isPro = (u) =>
-  !!u && (isAdmin(u.tg_id) || !!(u.plan_expires && new Date(u.plan_expires) > new Date()));
+  FREE_MODE || (!!u && (isAdmin(u.tg_id) || !!(u.plan_expires && new Date(u.plan_expires) > new Date())));
 
 // Builds the customer list from past documents the first time a Pro user opens Customers
 async function syncCustomers(id) {
@@ -337,7 +356,8 @@ const menuKeyboard = (uid) => {
     rows[1] = [w('👥 Customers', 'customers'), w('📂 My Documents', 'docs')];
     rows[2] = [w('🏢 Business Profile', 'profile'), btn('🎨 Templates', 'tpls')];
   }
-  rows.push(isAdmin(uid) ? [btn('ℹ️ Help', 'help')] : [btn('⭐ Upgrade', 'up'), btn('ℹ️ Help', 'help')]);
+  if (isAdmin(uid)) rows.push([btn(`🛠 Admin · ${FREE_MODE ? '🔓 Free mode' : '🔒 Paid mode'}`, 'adm')]);
+  rows.push(isAdmin(uid) || FREE_MODE ? [btn('ℹ️ Help', 'help')] : [btn('⭐ Upgrade', 'up'), btn('ℹ️ Help', 'help')]);
   return Markup.inlineKeyboard(rows);
 };
 
@@ -345,7 +365,8 @@ const cancelKeyboard = (to = 'menu') => Markup.inlineKeyboard([[btn('❌ Cancel'
 const backToMenu = () => Markup.inlineKeyboard([[btn('⬅️ Menu', 'menu')]]);
 
 async function statusLine(u) {
-  if (isAdmin(u.tg_id)) return '👑 Admin · all features unlocked';
+  if (isAdmin(u.tg_id)) return `👑 Admin · all features unlocked${FREE_MODE ? ' · 🎁 free for everyone' : ''}`;
+  if (FREE_MODE) return '🎁 All features are free right now';
   if (isPro(u)) return `⭐ Pro active until ${fmtDate(u.plan_expires)}`;
   const n = await dayCount(u.tg_id);
   return `Free plan · ${n}/${FREE_LIMIT} documents used today`;
@@ -1075,15 +1096,63 @@ async function activate(tgId, planKey, reference, amountKobo) {
   return 'ok';
 }
 
+// ───────────────────────── Admin panel: Free / Paid switch ─────────────────────────
+async function adminPanel() {
+  const r = await pool.query(
+    `SELECT count(*)::int AS users,
+            count(*) FILTER (WHERE plan_expires > now())::int AS pro
+     FROM users`
+  );
+  const { users, pro } = r.rows[0];
+  const text =
+    `<b>🛠 Admin panel</b>\n\n` +
+    `Mode: <b>${FREE_MODE ? '🔓 FREE for everyone' : '🔒 PAID (Pro plans required)'}</b>\n\n` +
+    (FREE_MODE
+      ? `Every user has all Pro features, all templates and no daily limit. The Upgrade button is hidden and payments are blocked.\n\n`
+      : `Free users get ${FREE_LIMIT} documents a day and basic templates. Pro features need a paid plan.\n\n`) +
+    `👥 Users: <b>${users}</b> · ⭐ Active Pro: <b>${pro}</b>`;
+  const kb = Markup.inlineKeyboard([
+    [btn(FREE_MODE ? '🔒 Switch to PAID mode' : '🔓 Make everything FREE', FREE_MODE ? 'adm:paid' : 'adm:free')],
+    [btn('⬅️ Menu', 'menu')],
+  ]);
+  return { text, kb };
+}
+async function showAdmin(ctx, fresh) {
+  const a = await adminPanel();
+  if (fresh) await ctx.reply(a.text, opts(a.kb));
+  else await show(ctx, a.text, a.kb);
+}
+bot.command('admin', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return;
+  await showAdmin(ctx, true);
+});
+bot.action('adm', async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('Admins only.', { show_alert: true });
+  await ctx.answerCbQuery();
+  await showAdmin(ctx, false);
+});
+bot.action(/^adm:(free|paid)$/, async (ctx) => {
+  if (!isAdmin(ctx.from.id)) return ctx.answerCbQuery('Admins only.', { show_alert: true });
+  const on = ctx.match[1] === 'free';
+  await setFreeMode(on);
+  console.log(`Admin ${ctx.from.id} switched the bot to ${on ? 'FREE' : 'PAID'} mode`);
+  await ctx.answerCbQuery(on ? '🔓 Everything is now free' : '🔒 Paid mode on');
+  await showAdmin(ctx, false);
+});
+
 bot.action('up', async (ctx) => {
   await ctx.answerCbQuery();
   const u = await getUser(ctx.from.id);
   if (isAdmin(u.tg_id)) return show(ctx, '👑 You are an admin: every feature is already unlocked.', backToMenu());
+  if (FREE_MODE) return show(ctx, '🎁 <b>Everything is free right now.</b>\nAll Pro features are unlocked for you, with no daily limit.', backToMenu());
   await showUpgrade(ctx, isPro(u) ? `You're on Pro until ${fmtDate(u.plan_expires)}. Buying again extends it.` : '');
 });
 
 bot.action(/^buy:(monthly|quarterly|yearly)$/, async (ctx) => {
   await ctx.answerCbQuery();
+  if (FREE_MODE) {
+    return show(ctx, '🎁 <b>Everything is free right now.</b> No payment needed.', backToMenu());
+  }
   if (!PAYSTACK_SECRET) {
     return show(ctx, 'Payments are not set up yet. Please try again later.', backToMenu());
   }
@@ -1621,6 +1690,8 @@ app.post('/paystack/webhook', express.raw({ type: '*/*' }), async (req, res) => 
 // ───────────────────────── Start ─────────────────────────
 (async () => {
   await initDb();
+  await loadSettings();
+  console.log(`Mode: ${FREE_MODE ? 'FREE for everyone' : 'PAID (Pro plans)'}`);
   const me = await retry(() => bot.telegram.getMe());
   BOT_NAME = me.username;
   // Registers the "Menu" button next to the message box (shows on desktop and mobile)
